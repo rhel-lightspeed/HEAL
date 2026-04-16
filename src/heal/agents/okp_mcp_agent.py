@@ -2425,6 +2425,12 @@ class OkpMcpAgent:
             emoji = "✅" if result.context_precision >= 0.70 else "⚠️"
             print(f"   {emoji} Context Precision:  {result.context_precision:.2f}")
 
+        # Composite score
+        composite = self._calculate_composite_metric(result)
+        if composite > 0:
+            emoji = "✅" if composite >= 0.80 else "⚠️"
+            print(f"   {emoji} Composite Score:    {composite:.2f} (threshold: 0.80)")
+
         print()  # Blank line for readability
 
     def parse_results(self, output_dir: Path, ticket_id: Optional[str]) -> EvaluationResult:
@@ -2867,16 +2873,19 @@ class OkpMcpAgent:
         return 0.0
 
     def _calculate_composite_metric(self, result: EvaluationResult) -> float:
-        """Calculate composite metric prioritizing answer quality and grounding.
+        """Calculate composite metric prioritizing answer correctness.
 
-        Weights (in priority order):
-        1. Answer correctness (40%) - if available
-        2. Context relevance (30%) - RAGAS metric (docs relate to question)
-        3. Context precision (15%) - RAGAS metric (docs are precise)
-        4. Keywords (10%) - required facts present
-        5. Forbidden claims (5%) - no incorrect info
+        Weights (in priority order - CUSTOMER-FOCUSED):
+        1. Answer correctness (70%) - THE most important metric for customers
+        2. Context relevance (15%) - RAGAS metric (docs relate to question)
+        3. Context precision (10%) - RAGAS metric (docs are precise)
+        4. Keywords (3%) - required facts present
+        5. Forbidden claims (2%) - no incorrect info
 
         URL F1 is intentionally EXCLUDED - it's unreliable.
+
+        NOTE: If answer_correctness >= 0.90, composite will likely pass (contributes 0.63).
+        This reflects customer reality: correct answers matter most.
 
         Returns:
             Composite score between 0.0 and 1.0
@@ -2884,35 +2893,35 @@ class OkpMcpAgent:
         components = []
         weights = []
 
-        # 1. Answer correctness (highest weight)
+        # 1. Answer correctness (DOMINANT weight - what customers care about)
         if result.answer_correctness is not None:
             components.append(result.answer_correctness)
-            weights.append(0.40)
+            weights.append(0.70)
         elif result.keywords_score is not None:
             # Fallback: use keywords if no answer_correctness
             components.append(result.keywords_score)
-            weights.append(0.40)
+            weights.append(0.70)
 
         # 2. Context relevance (RAGAS - most important retrieval metric)
         if result.context_relevance is not None:
             components.append(result.context_relevance)
-            weights.append(0.30)
+            weights.append(0.15)
 
         # 3. Context precision (RAGAS - secondary retrieval metric)
         if result.context_precision is not None:
             components.append(result.context_precision)
-            weights.append(0.15)
+            weights.append(0.10)
 
         # 4. Keywords (required facts)
         if result.keywords_score is not None and result.answer_correctness is not None:
             # Only include if we already have answer_correctness (avoid double counting)
             components.append(result.keywords_score)
-            weights.append(0.10)
+            weights.append(0.03)
 
         # 5. Forbidden claims (no regressions)
         if result.forbidden_claims_score is not None:
             components.append(result.forbidden_claims_score)
-            weights.append(0.05)
+            weights.append(0.02)
 
         # If no components available, return 0
         if not components:

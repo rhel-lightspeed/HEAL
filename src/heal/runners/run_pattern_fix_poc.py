@@ -353,7 +353,18 @@ class PatternFixAgent(OkpMcpAgent):
             print(f"Faithfulness:       {faith:.3f} (≥ 0.8)")
             print("\n💡 Answer-first approach: No need to optimize retrieval")
             print("   The LLM got the right answer, regardless of which docs were used.")
-            print("   This ticket will be marked skip=true for future iterations.\n")
+            print("   This ticket will be marked skip=true for future iterations.")
+
+            # Update skip tag in YAML config
+            ticket_classifications = baseline_result.final_metrics.get("ticket_classifications", {})
+            if ticket_classifications and self.cleaned_config and self.cleaned_config.exists():
+                print(f"\n🏷️  Setting skip=true in: {self.cleaned_config}")
+                self.update_skip_tags(self.cleaned_config, ticket_classifications, mode="set")
+                if ticket_id and ticket_id in ticket_classifications:
+                    classification = ticket_classifications[ticket_id]
+                    print(f"   Status: {classification.status.value}")
+                    print(f"   Skip: {classification.skip}")
+                print()
 
             result.success = True
             result.end_time = datetime.now().isoformat()
@@ -461,6 +472,9 @@ class PatternFixAgent(OkpMcpAgent):
         result.success = cla_result.success
         result.end_time = datetime.now().isoformat()
         result.duration_seconds = (datetime.now() - start_time).total_seconds()
+
+        # Print improvement summary
+        self._print_improvement_summary(result)
 
         return result
 
@@ -1055,33 +1069,46 @@ class PatternFixAgent(OkpMcpAgent):
                     print(f"   • {metric_info}")
                 print("   → Pattern fix may not be stable")
 
-            # Success if all metrics pass
-            passing = answer_correct >= 0.90 and faithful >= 0.8 and url_f1 >= 0.7
+            # Calculate composite score (weights: answer 40%, context relevance 30%, precision 15%, keywords 10%, forbidden 5%)
+            composite_score = self._calculate_composite_metric(result)
+            COMPOSITE_THRESHOLD = 0.80  # High quality across all metrics
+
+            passing = composite_score >= COMPOSITE_THRESHOLD
 
             if passing:
-                print("\n✅ Final pattern validation PASSED")
+                print(f"\n✅ Final pattern validation PASSED")
+                print(f"   Composite Score: {composite_score:.2f} (≥ {COMPOSITE_THRESHOLD:.2f})")
                 print("   → All tickets validated")
                 print("   → No regressions detected")
                 print("   → Fixes are stable")
             else:
-                print("\n❌ Final pattern validation FAILED")
+                print(f"\n❌ Final pattern validation FAILED")
+                print(f"   Composite Score: {composite_score:.2f} < {COMPOSITE_THRESHOLD:.2f}")
+                print("\n   Metric Breakdown:")
                 if answer_correct < 0.90:
-                    print(f"   Answer correctness: {answer_correct:.2f} < 0.90")
+                    print(f"   • Answer correctness: {answer_correct:.2f} (target: ≥0.90)")
+                else:
+                    print(f"   ✓ Answer correctness: {answer_correct:.2f}")
                 if faithful < 0.8:
-                    print(f"   Faithfulness: {faithful:.2f} < 0.8")
+                    print(f"   • Faithfulness: {faithful:.2f} (target: ≥0.80)")
+                else:
+                    print(f"   ✓ Faithfulness: {faithful:.2f}")
                 if url_f1 < 0.7:
-                    print(f"   URL F1: {url_f1:.2f} < 0.7")
+                    print(f"   • URL F1: {url_f1:.2f} (target: ≥0.70)")
+                else:
+                    print(f"   ✓ URL F1: {url_f1:.2f}")
 
             return PhaseResult(
                 phase_name="final_pattern_validation",
                 success=passing,
                 iterations=1,
                 final_metrics={
+                    "composite_score": composite_score,
                     "answer_correctness": answer_correct,
                     "faithfulness": faithful,
                     "url_f1": url_f1,
                 },
-                reason=f"All tickets validated, metrics passing={passing}",
+                reason=f"All tickets validated, composite_score={composite_score:.2f}, passing={passing}",
             )
 
         except Exception as e:
@@ -1307,6 +1334,86 @@ class PatternFixAgent(OkpMcpAgent):
         print("   TODO: Automated variance analysis (see docs/VARIANCE_SOLUTIONS.md)")
         print("   Human review required - check diagnostics for root cause")
         # Future: implement automated analysis from docs/VARIANCE_SOLUTIONS.md
+
+    def _print_improvement_summary(self, result: PatternFixResult) -> None:
+        """Print improvement summary showing metric trends across phases.
+
+        Args:
+            result: PatternFixResult with all phase results
+        """
+        print("\n" + "=" * 80)
+        print("📈 IMPROVEMENT SUMMARY")
+        print("=" * 80)
+
+        # Extract metrics from each phase
+        baseline_metrics = result.baseline.final_metrics if result.baseline else {}
+        opt_metrics = result.optimization.final_metrics if result.optimization else {}
+        final_metrics = result.stability.final_metrics if result.stability else {}
+
+        # Calculate composite scores for each phase
+        baseline_composite = baseline_metrics.get("composite_score")
+        final_composite = final_metrics.get("composite_score")
+
+        print("\n┌─ PHASE PROGRESSION ─────────────────────────────────────────┐")
+        print("│                                                              │")
+
+        # Answer Correctness
+        baseline_ans = baseline_metrics.get("answer_correctness", 0.0)
+        final_ans = final_metrics.get("answer_correctness", 0.0)
+        ans_change = final_ans - baseline_ans
+        ans_arrow = "→" if abs(ans_change) < 0.01 else ("↗" if ans_change > 0 else "↘")
+        print(f"│  Answer Correctness:  {baseline_ans:.2f} {ans_arrow} {final_ans:.2f}  ({ans_change:+.2f})       │")
+
+        # Faithfulness
+        baseline_faith = baseline_metrics.get("faithfulness", 0.0)
+        final_faith = final_metrics.get("faithfulness", 0.0)
+        faith_change = final_faith - baseline_faith
+        faith_arrow = "→" if abs(faith_change) < 0.01 else ("↗" if faith_change > 0 else "↘")
+        print(f"│  Faithfulness:        {baseline_faith:.2f} {faith_arrow} {final_faith:.2f}  ({faith_change:+.2f})       │")
+
+        # URL F1
+        baseline_url = baseline_metrics.get("url_f1", 0.0)
+        final_url = final_metrics.get("url_f1", 0.0)
+        url_change = final_url - baseline_url
+        url_arrow = "→" if abs(url_change) < 0.01 else ("↗" if url_change > 0 else "↘")
+        print(f"│  URL F1:              {baseline_url:.2f} {url_arrow} {final_url:.2f}  ({url_change:+.2f})       │")
+
+        # Composite Score (if available)
+        if baseline_composite is not None and final_composite is not None:
+            comp_change = final_composite - baseline_composite
+            comp_arrow = "→" if abs(comp_change) < 0.01 else ("↗" if comp_change > 0 else "↘")
+            print(f"│  Composite Score:     {baseline_composite:.2f} {comp_arrow} {final_composite:.2f}  ({comp_change:+.2f})       │")
+
+        print("│                                                              │")
+        print("└──────────────────────────────────────────────────────────────┘")
+
+        # Show optimization details if available
+        if result.optimization and result.optimization.iterations > 0:
+            print(f"\n💡 Optimization: {result.optimization.iterations} iterations")
+            print(f"   {result.optimization.reason}")
+
+        # Overall verdict
+        print("\n┌─ OVERALL RESULT ────────────────────────────────────────────┐")
+        print("│                                                              │")
+        if result.success:
+            print("│  ✅ PATTERN FIX SUCCESSFUL                                   │")
+        else:
+            print("│  ❌ PATTERN FIX INCOMPLETE                                   │")
+
+        if final_composite is not None:
+            threshold = 0.80
+            if final_composite >= threshold:
+                print(f"│  Composite score {final_composite:.2f} meets threshold {threshold:.2f}           │")
+            else:
+                print(f"│  Composite score {final_composite:.2f} below threshold {threshold:.2f}          │")
+
+        print("│                                                              │")
+        print("└──────────────────────────────────────────────────────────────┘")
+
+        # Duration
+        duration_min = result.duration_seconds / 60
+        print(f"\n⏱️  Total Duration: {duration_min:.1f} minutes")
+        print("=" * 80 + "\n")
 
     def _is_passing(self, metrics: Dict, answer_threshold: float) -> bool:
         """Check if metrics indicate passing ticket.
