@@ -10,7 +10,13 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from claude_agent_sdk import query as claude_query, ClaudeAgentOptions
+try:
+    from claude_agent_sdk import query as claude_query, ClaudeAgentOptions
+    CLAUDE_SDK_AVAILABLE = True
+except ModuleNotFoundError:
+    CLAUDE_SDK_AVAILABLE = False
+    claude_query = None
+    ClaudeAgentOptions = None
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +56,12 @@ class AnswerReviewAgent:
         Returns:
             ReviewResult with pass/fail, issues, and suggested fixes
         """
+        if not CLAUDE_SDK_AVAILABLE:
+            raise RuntimeError(
+                "claude-agent-sdk is not installed. "
+                "Install it with: uv pip install claude-agent-sdk"
+            )
+
         if not expected_response or not expected_response.strip():
             return ReviewResult(
                 passes=False,

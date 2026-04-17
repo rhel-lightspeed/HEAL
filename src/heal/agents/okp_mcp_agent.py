@@ -31,7 +31,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
 import yaml
@@ -361,6 +361,50 @@ class EvaluationResult:
 
         urls = re.findall(r'https?://[^\s"]+', contexts_str)
         return len(urls) if urls else 1  # At least 1 if contexts exist
+
+
+@dataclass
+class PatternEvaluationResult:
+    """Results for pattern-wide evaluation (multiple tickets).
+
+    Stores per-ticket results individually while providing pattern-level aggregates.
+    Used when evaluating a full pattern (ticket_id=None) instead of a single ticket.
+    """
+
+    pattern_id: str
+    num_runs: int
+    per_ticket_results: Dict[str, EvaluationResult] = field(default_factory=dict)
+
+    # Pattern-level aggregates (for convenience, not primary source of truth)
+    pattern_url_f1: float = 0.0
+    pattern_answer_correctness: float = 0.0
+    pattern_faithfulness: float = 0.0
+    pattern_composite_score: float = 0.0
+
+    # Pattern-level diagnostics
+    success_rate: float = 0.0  # Percentage of tickets passing composite threshold
+    passing_tickets: List[str] = field(default_factory=list)
+    failing_tickets: List[str] = field(default_factory=list)
+    rag_bypass_tickets: List[str] = field(default_factory=list)  # Tickets where RAG wasn't used
+    high_variance_tickets: List[str] = field(default_factory=list)  # Tickets with unstable metrics
+
+    # Aggregate variance tracking
+    high_variance_metrics: List[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        """Human-readable summary of pattern results."""
+        lines = [f"Pattern: {self.pattern_id}"]
+        lines.append(f"  Tickets Evaluated: {len(self.per_ticket_results)}")
+        lines.append(f"  Success Rate: {self.success_rate:.0%} ({len(self.passing_tickets)}/{len(self.per_ticket_results)})")
+        lines.append(f"  Pattern Composite Score: {self.pattern_composite_score:.2f}")
+
+        if self.rag_bypass_tickets:
+            lines.append(f"  ⚠️  RAG Bypass: {len(self.rag_bypass_tickets)} tickets")
+
+        if self.high_variance_tickets:
+            lines.append(f"  ⚠️  High Variance: {len(self.high_variance_tickets)} tickets")
+
+        return "\n".join(lines)
 
 
 class OkpMcpAgent:
@@ -1593,6 +1637,10 @@ class OkpMcpAgent:
 
         start_time = time.time()
 
+        # Get existing suite directories before starting (to ignore old runs)
+        output_base = self.eval_root / "okp_mcp_full_output"
+        existing_suites = set(output_base.glob("suite_*")) if output_base.exists() else set()
+
         # Start subprocess in background
         proc = subprocess.Popen(
             [
@@ -1608,17 +1656,22 @@ class OkpMcpAgent:
         )
 
         # Monitor progress by checking which runs have completed
-        output_base = self.eval_root / "okp_mcp_full_output"
         last_completed = 0
+        current_suite = None
 
         while proc.poll() is None:
             # Count completed runs by looking for summary.json files
             try:
-                suite_dirs = sorted(output_base.glob("suite_*"), key=lambda p: p.stat().st_mtime)
-                if suite_dirs:
-                    latest_suite = suite_dirs[-1]
+                # Find NEW suite directory created after we started
+                if current_suite is None:
+                    suite_dirs = sorted(output_base.glob("suite_*"), key=lambda p: p.stat().st_mtime)
+                    new_suites = [s for s in suite_dirs if s not in existing_suites]
+                    if new_suites:
+                        current_suite = new_suites[-1]  # Get the newest one
+
+                if current_suite and current_suite.exists():
                     # Count run directories that have a summary.json file (indicating completion)
-                    completed_runs = len(list(latest_suite.glob("run_*/evaluation_*_summary.json")))
+                    completed_runs = len(list(current_suite.glob("run_*/evaluation_*_summary.json")))
 
                     if completed_runs > last_completed:
                         elapsed = time.time() - start_time
@@ -1917,6 +1970,10 @@ class OkpMcpAgent:
 
         start_time = time.time()
 
+        # Get existing suite directories before starting (to ignore old runs)
+        output_base = self.eval_root / "mcp_retrieval_output"
+        existing_suites = set(output_base.glob("suite_*")) if output_base.exists() else set()
+
         # Start subprocess in background
         proc = subprocess.Popen(
             [
@@ -1934,16 +1991,21 @@ class OkpMcpAgent:
         )
 
         # Monitor progress by checking for completed runs
-        output_base = self.eval_root / "mcp_retrieval_output"
         last_completed = 0
+        current_suite = None
 
         while proc.poll() is None:
             try:
-                suite_dirs = sorted(output_base.glob("suite_*"), key=lambda p: p.stat().st_mtime)
-                if suite_dirs:
-                    latest_suite = suite_dirs[-1]
+                # Find NEW suite directory created after we started
+                if current_suite is None:
+                    suite_dirs = sorted(output_base.glob("suite_*"), key=lambda p: p.stat().st_mtime)
+                    new_suites = [s for s in suite_dirs if s not in existing_suites]
+                    if new_suites:
+                        current_suite = new_suites[-1]  # Get the newest one
+
+                if current_suite and current_suite.exists():
                     # Count completed runs by looking for summary.json files
-                    completed_runs = len(list(latest_suite.glob("run_*/evaluation_*_summary.json")))
+                    completed_runs = len(list(current_suite.glob("run_*/evaluation_*_summary.json")))
 
                     if completed_runs > last_completed:
                         elapsed = time.time() - start_time
@@ -2398,8 +2460,51 @@ class OkpMcpAgent:
             ticket_id: Ticket ID or None for full pattern
             runs: Number of runs that were executed
         """
+        # Get aggregated result
         result = self.parse_results(output_dir, ticket_id)
 
+        # Get per-run results if multiple runs
+        per_run_scores = []
+        if runs > 1:
+            run_dirs = sorted(output_dir.glob("run_*"))
+            for run_dir in run_dirs:
+                try:
+                    run_result = self.parse_results(run_dir.parent, ticket_id)  # Parse from single run
+                    csv_files = list(run_dir.glob("evaluation_*_detailed.csv"))
+                    if csv_files:
+                        import pandas as pd
+                        df = pd.read_csv(csv_files[0])
+
+                        # Filter to ticket if specified
+                        if ticket_id:
+                            normalized_ticket_id = ticket_id.replace("-", "_")
+                            ticket_df = df[df["conversation_group_id"] == normalized_ticket_id]
+                        else:
+                            ticket_df = df
+
+                        # Extract scores for this run
+                        run_scores = {}
+                        for metric_id in ["custom:answer_correctness", "ragas:faithfulness", "custom:url_retrieval_eval"]:
+                            metric_rows = ticket_df[ticket_df["metric_identifier"] == metric_id]
+                            if not metric_rows.empty:
+                                run_scores[metric_id] = metric_rows["score"].mean()
+
+                        per_run_scores.append(run_scores)
+                except Exception:
+                    pass
+
+        # Print per-run breakdown if available
+        if per_run_scores and len(per_run_scores) > 1:
+            print(f"\n   📊 PER-RUN SCORES:")
+            print("   ─────────────────────────────────")
+            for i, run_score in enumerate(per_run_scores, 1):
+                answer = run_score.get("custom:answer_correctness", 0)
+                faith = run_score.get("ragas:faithfulness", 0)
+                url_f1 = run_score.get("custom:url_retrieval_eval", 0)
+                print(f"   Run {i}: Answer={answer:.2f}, Faith={faith:.2f}, URL_F1={url_f1:.2f}")
+            print()
+
+        # Print averaged scores
         print(f"\n   📊 SCORES (avg of {runs} run{'s' if runs > 1 else ''}):")
         print("   ─────────────────────────────────")
 
@@ -2653,23 +2758,26 @@ class OkpMcpAgent:
 
         return result
 
-    def parse_results_per_ticket(self, output_dir: Path) -> Dict[str, List[Dict[str, float]]]:
-        """Parse evaluation results grouped by ticket, keeping per-run scores.
+    def parse_results_per_ticket(self, output_dir: Path) -> Dict[str, List[Dict[str, Any]]]:
+        """Parse evaluation results grouped by ticket, keeping per-run scores AND metadata.
 
         Unlike parse_results() which averages scores, this method preserves
-        individual run scores for stability classification.
+        individual run scores for stability classification, PLUS extracts metadata
+        needed for RAG bypass detection and URL comparison.
 
         Args:
             output_dir: Path to evaluation output directory
 
         Returns:
-            Dict mapping ticket_id → list of per-run metric dicts
+            Dict mapping ticket_id → list of per-run dicts with metrics + metadata
             Example:
             {
                 "RSPEED-2218": [
-                    {"answer_correctness": 0.95, "url_f1": 0.8, "faithfulness": 0.9},  # run 1
-                    {"answer_correctness": 0.50, "url_f1": 0.7, "faithfulness": 0.85}, # run 2
-                    {"answer_correctness": 0.92, "url_f1": 0.75, "faithfulness": 0.88}, # run 3
+                    {
+                        "metrics": {"answer_correctness": 0.95, "url_f1": 0.8, ...},
+                        "metadata": {"tool_calls": "...", "contexts": "...", ...}
+                    },  # run 1
+                    ...
                 ],
                 "RSPEED-2219": [...]
             }
@@ -2701,12 +2809,59 @@ class OkpMcpAgent:
         # Get unique ticket IDs
         ticket_ids = df["conversation_group_id"].unique()
 
-        # Build per-ticket, per-run results
+        # Build per-ticket, per-run results WITH metadata
         results = {}
         for ticket_id in ticket_ids:
             ticket_df = df[df["conversation_group_id"] == ticket_id]
 
-            # Group by run number
+            # Extract metadata from first row (same across all runs for a ticket)
+            first_row = ticket_df.iloc[0]
+            tool_calls = first_row.get("tool_calls")
+            contexts = first_row.get("contexts")
+
+            # Extract retrieved URLs from tool_calls JSON
+            retrieved_urls = []
+            if pd.notna(tool_calls) and tool_calls:
+                try:
+                    tool_calls_data = json.loads(str(tool_calls))
+                    if isinstance(tool_calls_data, list) and len(tool_calls_data) > 0:
+                        for turn_calls in tool_calls_data:
+                            if isinstance(turn_calls, list):
+                                for call in turn_calls:
+                                    if isinstance(call, dict) and "result" in call:
+                                        call_result = call["result"]
+                                        if isinstance(call_result, dict) and "contexts" in call_result:
+                                            ctxs = call_result["contexts"]
+                                            if isinstance(ctxs, list):
+                                                for ctx in ctxs:
+                                                    if isinstance(ctx, dict):
+                                                        url = ctx.get("url", "")
+                                                        if url:
+                                                            url_normalized = url.replace("https://", "").replace("http://", "")
+                                                            retrieved_urls.append(url_normalized)
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    pass
+
+            # Get expected URLs from test config
+            expected_urls = []
+            test_config = self._load_test_config_for_ticket(ticket_id)
+            if test_config and "turns" in test_config:
+                first_turn = test_config["turns"][0]
+                expected_urls = first_turn.get("expected_urls", [])
+
+            # Check RAG usage
+            rag_used = False
+            if pd.notna(tool_calls) and tool_calls:
+                tool_calls_str = str(tool_calls).lower()
+                rag_used = any(kw in tool_calls_str for kw in ["search", "portal", "retrieve", "mcp"])
+
+            # Check if documents were retrieved
+            docs_retrieved = False
+            if pd.notna(contexts) and contexts:
+                contexts_str = str(contexts).strip()
+                docs_retrieved = contexts_str != "" and contexts_str != "[]" and contexts_str != "null"
+
+            # Group by run number to get per-run metrics
             run_numbers = sorted(ticket_df["run_number"].unique())
             ticket_runs = []
 
@@ -2744,7 +2899,18 @@ class OkpMcpAgent:
 
                 ticket_runs.append(run_metrics)
 
-            results[ticket_id] = ticket_runs
+            # Store both runs and metadata
+            results[ticket_id] = {
+                "runs": ticket_runs,
+                "metadata": {
+                    "tool_calls": tool_calls,
+                    "contexts": contexts,
+                    "expected_urls": expected_urls,
+                    "retrieved_urls": retrieved_urls,
+                    "rag_used": rag_used,
+                    "docs_retrieved": docs_retrieved,
+                }
+            }
 
         return results
 
@@ -3208,13 +3374,193 @@ Answer in JSON format:
 
         return None
 
+    def _build_evaluation_result_from_runs(
+        self,
+        ticket_id: str,
+        runs: List[Dict[str, float]],
+        metadata: Dict[str, Any],
+    ) -> EvaluationResult:
+        """Build EvaluationResult for single ticket from multiple runs.
+
+        Args:
+            ticket_id: Ticket ID
+            runs: List of dictionaries, each containing metric scores from one run
+            metadata: Dict with RAG usage, URLs, and other ticket-level metadata
+
+        Returns:
+            EvaluationResult with averaged metrics and variance analysis
+        """
+        if not runs:
+            # No data for this ticket
+            return EvaluationResult(ticket_id=ticket_id, num_runs=0)
+
+        num_runs = len(runs)
+
+        # Calculate averages and variance for each metric
+        metrics_by_name: Dict[str, List[float]] = {}
+        for run in runs:
+            for metric_name, value in run.items():
+                if value is not None:
+                    if metric_name not in metrics_by_name:
+                        metrics_by_name[metric_name] = []
+                    metrics_by_name[metric_name].append(value)
+
+        # Average each metric
+        averages = {
+            name: sum(values) / len(values)
+            for name, values in metrics_by_name.items()
+        }
+
+        # Detect high variance metrics (std > 15% of mean)
+        import statistics
+
+        high_variance_metrics = []
+        for name, values in metrics_by_name.items():
+            if len(values) > 1:
+                mean_val = statistics.mean(values)
+                if mean_val > 0:  # Avoid division by zero
+                    std_val = statistics.stdev(values)
+                    if std_val / mean_val > 0.15:  # More than 15% variance
+                        high_variance_metrics.append(f"{name} (std={std_val:.3f})")
+
+        # Build EvaluationResult with averaged metrics AND metadata
+        # NOTE: parse_results_per_ticket uses simplified keys (url_f1, answer_correctness, etc.)
+        # not the full metric identifiers (custom:url_retrieval_eval, etc.)
+        result = EvaluationResult(
+            ticket_id=ticket_id,
+            # Averaged metrics
+            url_f1=averages.get("url_f1"),
+            mrr=averages.get("mrr"),
+            context_relevance=averages.get("context_relevance"),
+            context_precision=averages.get("context_precision"),
+            keywords_score=averages.get("keywords_score"),
+            forbidden_claims_score=averages.get("forbidden_claims_score"),
+            faithfulness=averages.get("faithfulness"),
+            answer_correctness=averages.get("answer_correctness"),
+            response_relevancy=averages.get("response_relevancy"),
+            num_runs=num_runs,
+            high_variance_metrics=high_variance_metrics,
+            # Metadata from CSV/config (same across all runs)
+            tool_calls=metadata.get("tool_calls"),
+            contexts=metadata.get("contexts"),
+            expected_urls=metadata.get("expected_urls", []),
+            retrieved_urls=metadata.get("retrieved_urls", []),
+            rag_used=metadata.get("rag_used", False),
+            docs_retrieved=metadata.get("docs_retrieved", False),
+        )
+
+        return result
+
+    def _build_pattern_result(
+        self,
+        pattern_id: str,
+        per_ticket_results: Dict[str, EvaluationResult],
+        num_runs: int,
+        composite_threshold: float = 0.80,
+    ) -> PatternEvaluationResult:
+        """Build PatternEvaluationResult from per-ticket results.
+
+        Args:
+            pattern_id: Pattern identifier
+            per_ticket_results: Map of ticket_id → EvaluationResult
+            num_runs: Number of evaluation runs
+            composite_threshold: Threshold for passing (default 0.80)
+
+        Returns:
+            PatternEvaluationResult with pattern-level aggregates and diagnostics
+        """
+        if not per_ticket_results:
+            return PatternEvaluationResult(
+                pattern_id=pattern_id,
+                num_runs=num_runs,
+            )
+
+        # Calculate pattern-level aggregates
+        url_f1_values = [r.url_f1 for r in per_ticket_results.values() if r.url_f1 is not None]
+        answer_values = [
+            r.answer_correctness
+            for r in per_ticket_results.values()
+            if r.answer_correctness is not None
+        ]
+        faith_values = [
+            r.faithfulness for r in per_ticket_results.values() if r.faithfulness is not None
+        ]
+
+        pattern_url_f1 = sum(url_f1_values) / len(url_f1_values) if url_f1_values else 0.0
+        pattern_answer = sum(answer_values) / len(answer_values) if answer_values else 0.0
+        pattern_faith = sum(faith_values) / len(faith_values) if faith_values else 0.0
+
+        # Calculate composite scores for each ticket
+        passing_tickets = []
+        failing_tickets = []
+        rag_bypass_tickets = []
+        high_variance_tickets = []
+        all_high_variance_metrics = []
+
+        for ticket_id, result in per_ticket_results.items():
+            # Calculate composite score (normal RAG weighting for now)
+            # TODO: Apply different weights for RAG bypass scenarios
+            if result.answer_correctness is not None:
+                composite = (
+                    0.80 * (result.answer_correctness or 0)
+                    + 0.15 * (result.context_relevance or 0)
+                    + 0.05 * (result.context_precision or 0)
+                )
+            else:
+                # Retrieval-only mode
+                composite = (result.url_f1 or 0) * 0.5 + (result.context_relevance or 0) * 0.5
+
+            # Classify tickets
+            if composite >= composite_threshold:
+                passing_tickets.append(ticket_id)
+            else:
+                failing_tickets.append(ticket_id)
+
+            # Detect RAG bypass
+            if not result.rag_used or (result.rag_used and not result.docs_retrieved):
+                rag_bypass_tickets.append(ticket_id)
+
+            # Detect high variance
+            if result.high_variance_metrics:
+                high_variance_tickets.append(ticket_id)
+                all_high_variance_metrics.extend(result.high_variance_metrics)
+
+        # Calculate success rate
+        success_rate = len(passing_tickets) / len(per_ticket_results) if per_ticket_results else 0.0
+
+        # Deduplicate high variance metrics
+        unique_high_variance = list(set(all_high_variance_metrics))
+
+        # Calculate pattern composite
+        pattern_composite = (
+            0.80 * pattern_answer + 0.15 * pattern_url_f1 + 0.05 * pattern_faith
+            if pattern_answer > 0
+            else pattern_url_f1 * 0.5
+        )
+
+        return PatternEvaluationResult(
+            pattern_id=pattern_id,
+            num_runs=num_runs,
+            per_ticket_results=per_ticket_results,
+            pattern_url_f1=pattern_url_f1,
+            pattern_answer_correctness=pattern_answer,
+            pattern_faithfulness=pattern_faith,
+            pattern_composite_score=pattern_composite,
+            success_rate=success_rate,
+            passing_tickets=passing_tickets,
+            failing_tickets=failing_tickets,
+            rag_bypass_tickets=rag_bypass_tickets,
+            high_variance_tickets=high_variance_tickets,
+            high_variance_metrics=unique_high_variance,
+        )
+
     def diagnose_retrieval_only(
         self,
         ticket_id: Optional[str],
         runs: int = 1,
         iteration: Optional[int] = None,
         suggestion: Optional[Any] = None,
-    ) -> EvaluationResult:
+    ) -> Union[EvaluationResult, PatternEvaluationResult]:
         """Fast diagnosis using retrieval-only mode (no answer generation).
 
         This is much faster (~30 sec vs 3 min) but only evaluates retrieval metrics:
@@ -3232,47 +3578,78 @@ Answer in JSON format:
             suggestion: Optional LLM suggestion object (for saving to diagnostics)
 
         Returns:
-            EvaluationResult with retrieval metrics only (answer metrics will be None)
+            EvaluationResult if ticket_id specified (single ticket)
+            PatternEvaluationResult if ticket_id=None (full pattern with per-ticket results)
         """
-        # Run retrieval-only eval for just this ticket
+        # Run retrieval-only eval
         output_dir = self.run_retrieval_eval(
             self.functional_retrieval, runs=runs, single_ticket=ticket_id
         )
 
-        # Parse results (answer metrics will be None)
-        result = self.parse_results(output_dir, ticket_id)
+        # Check if this is pattern mode (multiple tickets) or single ticket mode
+        if ticket_id is None:
+            # Pattern mode: Build per-ticket results
+            print("\n📊 Building per-ticket results for pattern...")
 
-        # Display retrieved vs expected URLs
-        self.display_retrieved_vs_expected(result)
+            per_ticket_data = self.parse_results_per_ticket(output_dir)
 
-        # Inspect Solr query for unexpected augmentation
-        solr_query_info = None
-        if result.query:
-            solr_query_info = self.inspect_solr_query(result.query)
-            if solr_query_info and solr_query_info["injected_terms"]:
-                print("🔍 SOLR QUERY INSPECTION:")
-                print("=" * 80)
-                print(f"Original query: {solr_query_info['original']}")
-                print(f"Actual Solr query: {solr_query_info['actual']}")
-                print(f"⚠️  okp-mcp INJECTED terms: {', '.join(solr_query_info['injected_terms'])}")
-                print()
-                print("💡 These injected terms may be affecting retrieval quality.")
-                print("   Consider whether they're helping or harming the results.")
-                print()
+            # Build EvaluationResult for each ticket
+            per_ticket_results = {}
+            for tid, ticket_data in per_ticket_data.items():
+                ticket_result = self._build_evaluation_result_from_runs(
+                    tid, ticket_data["runs"], ticket_data["metadata"]
+                )
+                per_ticket_results[tid] = ticket_result
 
-        # Save diagnostics if this is part of an iteration loop
-        if iteration is not None:
-            diag_file = self.save_iteration_diagnostics(
-                ticket_id, iteration, result, solr_query_info, suggestion
+            # Build PatternEvaluationResult
+            # Extract pattern ID from config file or use default
+            pattern_id = "PATTERN"  # Default for functional test mode
+            if hasattr(self, 'pattern_id') and self.pattern_id:
+                pattern_id = self.pattern_id
+
+            pattern_result = self._build_pattern_result(
+                pattern_id, per_ticket_results, runs
             )
-            print(f"💾 Saved diagnostics: {diag_file.name}")
-            print()
 
-        return result
+            print(f"✅ Processed {len(per_ticket_results)} tickets")
+            return pattern_result
+
+        else:
+            # Single ticket mode: Use existing logic
+            # Parse results (answer metrics will be None)
+            result = self.parse_results(output_dir, ticket_id)
+
+            # Display retrieved vs expected URLs
+            self.display_retrieved_vs_expected(result)
+
+            # Inspect Solr query for unexpected augmentation
+            solr_query_info = None
+            if result.query:
+                solr_query_info = self.inspect_solr_query(result.query)
+                if solr_query_info and solr_query_info["injected_terms"]:
+                    print("🔍 SOLR QUERY INSPECTION:")
+                    print("=" * 80)
+                    print(f"Original query: {solr_query_info['original']}")
+                    print(f"Actual Solr query: {solr_query_info['actual']}")
+                    print(f"⚠️  okp-mcp INJECTED terms: {', '.join(solr_query_info['injected_terms'])}")
+                    print()
+                    print("💡 These injected terms may be affecting retrieval quality.")
+                    print("   Consider whether they're helping or harming the results.")
+                    print()
+
+            # Save diagnostics if this is part of an iteration loop
+            if iteration is not None:
+                diag_file = self.save_iteration_diagnostics(
+                    ticket_id, iteration, result, solr_query_info, suggestion
+                )
+                print(f"💾 Saved diagnostics: {diag_file.name}")
+                print()
+
+            return result
 
     def diagnose(
         self, ticket_id: Optional[str], use_existing: bool = False, runs: int = 1
-    ) -> EvaluationResult:
+    ) -> Union[EvaluationResult, PatternEvaluationResult]:
         """Diagnose a ticket (or full pattern) by running full evaluation.
 
         Args:
@@ -3281,7 +3658,8 @@ Answer in JSON format:
             runs: Number of evaluation runs (default: 1 for speed, use 3+ for stability analysis)
 
         Returns:
-            EvaluationResult with parsed metrics (averaged if ticket_id is None)
+            EvaluationResult if ticket_id specified (single ticket)
+            PatternEvaluationResult if ticket_id=None (full pattern with per-ticket results)
         """
         print(f"\n{'='*80}")
         if ticket_id:
@@ -3301,11 +3679,39 @@ Answer in JSON format:
                 self.functional_full, runs=runs, single_ticket=ticket_id
             )
 
-        # Parse results
-        result = self.parse_results(output_dir, ticket_id)
+        # Parse results - check if pattern mode or single ticket
+        if ticket_id is None:
+            # Pattern mode: Build per-ticket results
+            print("\n📊 Building per-ticket results for pattern...")
+
+            per_ticket_data = self.parse_results_per_ticket(output_dir)
+
+            # Build EvaluationResult for each ticket
+            per_ticket_results = {}
+            for tid, ticket_data in per_ticket_data.items():
+                ticket_result = self._build_evaluation_result_from_runs(
+                    tid, ticket_data["runs"], ticket_data["metadata"]
+                )
+                per_ticket_results[tid] = ticket_result
+
+            # Build PatternEvaluationResult
+            pattern_id = "PATTERN"  # Default for functional test mode
+            if hasattr(self, 'pattern_id') and self.pattern_id:
+                pattern_id = self.pattern_id
+
+            result = self._build_pattern_result(pattern_id, per_ticket_results, runs)
+            print(f"✅ Processed {len(per_ticket_results)} tickets")
+        else:
+            # Single ticket mode
+            result = self.parse_results(output_dir, ticket_id)
 
         print("\n" + result.summary())
 
+        # For pattern mode, return early - detailed diagnostics are per-ticket
+        if isinstance(result, PatternEvaluationResult):
+            return result
+
+        # Single ticket mode continues with detailed diagnostics
         # Stability Assessment
         if result.num_runs > 1:
             print(f"\n📊 STABILITY ASSESSMENT ({result.num_runs} runs)")
@@ -3359,7 +3765,8 @@ Answer in JSON format:
             return result
 
         # Check if expected_urls exist (should ALWAYS exist after discovery)
-        if not result.expected_urls and result.expected_response:
+        # Skip this check in full-pattern mode (ticket_id = None) since result is aggregated
+        if ticket_id and not result.expected_urls and result.expected_response:
             print("\n❌ NO EXPECTED URLS FOUND IN CONFIG")
             print("   → This ticket has NO documentation in Solr containing the answer")
             print("   → This is a DOCUMENTATION GAP - cannot be fixed by RAG optimization")

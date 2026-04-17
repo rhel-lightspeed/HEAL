@@ -1,0 +1,48 @@
+{
+  "pattern_id": "BOOTLOADER_GRUB_ISSUES",
+  "per_ticket_results": {
+    "RSPEED-1723": [
+      {
+        "custom:url_retrieval_eval": 0.0,
+        "ragas:context_relevance": 1.0,
+        "ragas:context_precision_without_reference": 0.33333333331666665,
+        "custom:answer_correctness": 0.6,
+        "ragas:faithfulness": 0.38461538461538464,
+        "ragas:response_relevancy": 0.8824623068914629,
+        "metric_metadata": {
+          "description": "How relevant the response is to the question",
+          "default": false
+        }
+      }
+    ],
+    "RSPEED-1724": [
+      {
+        "custom:url_retrieval_eval": 0.0,
+        "ragas:context_relevance": 0.5,
+        "ragas:context_precision_without_reference": 0.0,
+        "custom:answer_correctness": 0.7,
+        "ragas:faithfulness": 0.1,
+        "ragas:response_relevancy": 0.8824623068914629,
+        "metric_metadata": {
+          "description": "How relevant the response is to the question",
+          "default": false
+        }
+      }
+    ],
+    "RSPEED-1725": [
+      {
+        "custom:url_retrieval_eval": 0.3333333333333333,
+        "ragas:context_relevance": 1.0,
+        "ragas:context_precision_without_reference": 0.33333333331666665,
+        "custom:answer_correctness": 0.3,
+        "ragas:faithfulness": 0.9473684210526315,
+        "ragas:response_relevancy": 0.8824623068914629,
+        "metric_metadata": {
+          "description": "How relevant the response is to the question",
+          "default": false,
+          "mrr": 0.09
+        }
+      }
+    ]
+  }
+}

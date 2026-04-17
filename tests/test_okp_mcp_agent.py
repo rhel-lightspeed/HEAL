@@ -1,6 +1,5 @@
 """Tests for OkpMcpAgent check_answer_in_retrieved_docs method."""
 
-
 import pytest
 from claude_agent_sdk import AssistantMessage
 

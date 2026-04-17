@@ -13,7 +13,13 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
-from claude_agent_sdk import query as claude_query, ClaudeAgentOptions
+try:
+    from claude_agent_sdk import query as claude_query, ClaudeAgentOptions
+    CLAUDE_SDK_AVAILABLE = True
+except ModuleNotFoundError:
+    CLAUDE_SDK_AVAILABLE = False
+    claude_query = None
+    ClaudeAgentOptions = None
 
 from .evaluation_ticket import Conversation, Turn
 from .solr_expert import (

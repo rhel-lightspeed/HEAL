@@ -719,21 +719,6 @@ class OkpMcpLLMAdvisor:
             print(f"   Medium model: {self.medium_model}")
             print(f"   Complex model: {self.complex_model}")
 
-    @property
-    def client(self):  # type: ignore[no-untyped-def]
-        """Lazy-load Anthropic client for direct API access (backward compatibility)."""
-        if not hasattr(self, "_client"):
-            try:
-                from anthropic import Anthropic
-
-                self._client = Anthropic()  # type: ignore[attr-defined]
-            except ImportError:
-                raise ImportError(
-                    "anthropic package required for direct client access. "
-                    "Install with: pip install anthropic"
-                )
-        return self._client  # type: ignore[attr-defined, return-value]
-
     async def _call_with_structured_output(
         self, model: str, system_prompt: str, user_prompt: str, output_schema: dict
     ) -> dict:

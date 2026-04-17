@@ -32,7 +32,16 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
-from heal.agents.okp_mcp_agent import OkpMcpAgent
+from heal.agents.okp_mcp_agent import OkpMcpAgent, PatternEvaluationResult, TIER_MODELS
+from heal.core.ticket_evaluation import PatternEvaluation, TicketEvaluation
+
+# Optional multi-agent system (requires claude-agent-sdk)
+try:
+    from heal.agents.solr_multi_agent import SolrMultiAgentSystem
+    MULTI_AGENT_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    SolrMultiAgentSystem = None
+    MULTI_AGENT_AVAILABLE = False
 
 # Force unbuffered output so prints show up immediately
 sys.stdout.reconfigure(line_buffering=True)
@@ -113,6 +122,26 @@ class PatternFixAgent(OkpMcpAgent):
         self._original_branch: Optional[str] = None  # Track original branch for cleanup
         self._cleanup_done: bool = False  # Prevent duplicate cleanup
 
+        # Track per-ticket baseline evaluation for comparison
+        self._baseline_pattern: Optional[PatternEvaluation] = None
+
+        # Initialize multi-agent system for better Solr optimization
+        if MULTI_AGENT_AVAILABLE:
+            try:
+                self.multi_agent = SolrMultiAgentSystem(
+                    okp_mcp_root=okp_mcp_root,
+                    model="claude-sonnet-4-6",
+                )
+                print("✅ Multi-agent Solr optimization enabled (Solr Expert + Code Expert)")
+            except Exception as e:
+                print(f"⚠️  Multi-agent system failed to initialize: {e}")
+                print("   Falling back to single-agent mode")
+                self.multi_agent = None
+        else:
+            print("⚠️  Multi-agent system not available (requires claude-agent-sdk)")
+            print("   Using single-agent mode")
+            self.multi_agent = None
+
         # Register cleanup handlers
         atexit.register(self.cleanup)
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -144,15 +173,53 @@ class PatternFixAgent(OkpMcpAgent):
         if not conversations:
             raise ValueError(f"No conversations found in {pattern_file}")
 
-        # Store ticket IDs for tracking
+        # Validate tickets and categorize by documentation availability
+        tickets_with_docs = 0
+        tickets_without_docs = []
+
         for conv in conversations:
-            self.pattern_tickets.append({"ticket_id": conv["conversation_group_id"]})
+            ticket_id = conv["conversation_group_id"]
+
+            # Check if ticket has expected_urls (documentation exists)
+            has_expected_urls = False
+            for turn in conv.get("turns", []):
+                if turn.get("expected_urls"):
+                    has_expected_urls = True
+                    break
+
+            # Track all tickets, but flag which ones lack docs
+            ticket_info = {"ticket_id": ticket_id, "has_expected_urls": has_expected_urls}
+            self.pattern_tickets.append(ticket_info)
+
+            if has_expected_urls:
+                tickets_with_docs += 1
+            else:
+                tickets_without_docs.append(ticket_id)
 
         # Use pattern file directly as test config (already in correct format)
         self.functional_full = pattern_file
         self.functional_retrieval = pattern_file
 
         print(f"✅ Loaded {len(self.pattern_tickets)} tickets for pattern {self.pattern_id}")
+        print(f"   • With documentation: {tickets_with_docs}")
+        print(f"   • Without documentation: {len(tickets_without_docs)}")
+
+        # Inform about no-doc tickets (answer-only evaluation)
+        if tickets_without_docs:
+            print("\n📋 NO-DOC TICKET HANDLING:")
+            print(f"   {len(tickets_without_docs)} ticket(s) have NO expected_urls")
+            print("   → These will be evaluated on ANSWER CORRECTNESS ONLY")
+            print("   → No retrieval optimization (docs don't exist)")
+            print("   → If answer >= 0.90, will mark as STABLE_PASSING and skip")
+            print("\n   ❓ Tickets without documentation:")
+            for ticket_id in tickets_without_docs:
+                print(f"      • {ticket_id}")
+            print("\n   💡 STRATEGY:")
+            print("      1. Baseline: Test answer_correctness only")
+            print("      2. If passing (≥0.90): Skip (LLM answered from training data)")
+            print("      3. If failing: Flag for SME review (needs new documentation)")
+            print("      4. Skip retrieval optimization (no docs to optimize)")
+            print("      5. Re-test in final validation (ensure no regression)\n")
 
     def _signal_handler(self, signum, frame):
         """Handle Ctrl+C and other signals gracefully."""
@@ -237,6 +304,13 @@ class PatternFixAgent(OkpMcpAgent):
             )
 
         print(f"✅ On branch: {self.branch_name}")
+
+        # CRITICAL: Restart container to use new branch code
+        print("\n🔄 Restarting okp-mcp container to load branch code...")
+        print(f"   Container mounts: {self.okp_mcp_root}/src")
+        print(f"   Current branch: {self.branch_name}")
+        self.restart_okp_mcp()
+        print(f"   ✅ Container restarted - now running code from {self.branch_name}")
 
     def run_fix_loop(
         self,
@@ -505,30 +579,58 @@ class PatternFixAgent(OkpMcpAgent):
 
             # Show key metrics from baseline
             print("\n📊 BASELINE METRICS:")
-            print(
-                f"   URL F1:             {result.url_f1:.2f}"
-                if result.url_f1 is not None
-                else "   URL F1:             N/A"
-            )
-            print(
-                f"   Answer Correctness: {result.answer_correctness:.2f}"
-                if result.answer_correctness is not None
-                else "   Answer Correctness: N/A"
-            )
-            print(
-                f"   Faithfulness:       {result.faithfulness:.2f}"
-                if result.faithfulness is not None
-                else "   Faithfulness:       N/A"
-            )
-            print(
-                f"   Context Relevance:  {result.context_relevance:.2f}"
-                if result.context_relevance is not None
-                else "   Context Relevance:  N/A"
-            )
+
+            # Handle both single ticket and pattern results
+            if isinstance(result, PatternEvaluationResult):
+                # Pattern mode - show pattern-level aggregates
+                print(f"   Pattern: {result.pattern_id}")
+                print(f"   Tickets Evaluated: {len(result.per_ticket_results)}")
+                print(f"   URL F1 (avg):             {result.pattern_url_f1:.2f}")
+                print(f"   Answer Correctness (avg): {result.pattern_answer_correctness:.2f}")
+                print(f"   Faithfulness (avg):       {result.pattern_faithfulness:.2f}")
+                print(f"   Success Rate:             {result.success_rate:.0%}")
+            else:
+                # Single ticket mode - show ticket metrics
+                print(
+                    f"   URL F1:             {result.url_f1:.2f}"
+                    if result.url_f1 is not None
+                    else "   URL F1:             N/A"
+                )
+                print(
+                    f"   Answer Correctness: {result.answer_correctness:.2f}"
+                    if result.answer_correctness is not None
+                    else "   Answer Correctness: N/A"
+                )
+                print(
+                    f"   Faithfulness:       {result.faithfulness:.2f}"
+                    if result.faithfulness is not None
+                    else "   Faithfulness:       N/A"
+                )
+                print(
+                    f"   Context Relevance:  {result.context_relevance:.2f}"
+                    if result.context_relevance is not None
+                    else "   Context Relevance:  N/A"
+                )
 
             # NEW: Get per-ticket, per-run results for classification
             output_dir = self.get_latest_output_dir("full")
             per_ticket_results = self.parse_results_per_ticket(output_dir)
+
+            # Build lookup of tickets without expected_urls (must come BEFORE usage)
+            no_doc_tickets = {
+                t["ticket_id"] for t in self.pattern_tickets if not t.get("has_expected_urls", True)
+            }
+
+            # Store baseline per-ticket evaluations for later comparison
+            self._baseline_pattern = PatternEvaluation(pattern_id=self.pattern_id)
+            for ticket_id, runs in per_ticket_results.items():
+                if runs:
+                    # Check if this is a no-doc ticket
+                    is_no_doc = ticket_id in no_doc_tickets
+                    ticket_eval = TicketEvaluation(
+                        ticket_id=ticket_id, runs=runs, is_no_doc=is_no_doc
+                    )
+                    self._baseline_pattern.tickets[ticket_id] = ticket_eval
 
             # Classify each ticket based on per-run scores
             ticket_classifications = {}
@@ -539,12 +641,30 @@ class PatternFixAgent(OkpMcpAgent):
                 ]
 
                 if ans_scores:
+                    # Check if this is a no-doc ticket
+                    is_no_doc = ticket in no_doc_tickets
+
                     classification = classify_stability(
                         ans_scores,
                         threshold=0.90,
                         catastrophic_threshold=0.70,
                         high_cv_threshold=0.15,
                     )
+
+                    # Override skip logic for no-doc tickets
+                    if is_no_doc:
+                        # For no-doc tickets, only answer_correctness matters
+                        # Mark as skip if passing (LLM answered from training data)
+                        if classification.status.value == "STABLE_PASSING":
+                            classification.skip = True
+                            classification.reason = f"{classification.reason} [NO-DOC: Answered from LLM training data, skip retrieval optimization]"
+                        else:
+                            # Failing no-doc ticket = needs new documentation
+                            classification.skip = False
+                            classification.priority = "HIGH"
+                            classification.needs_review = True
+                            classification.reason = f"{classification.reason} [NO-DOC: Failing without docs, needs SME review or new documentation]"
+
                     ticket_classifications[ticket] = classification
 
             # Display per-ticket classifications (full-pattern mode)
@@ -559,7 +679,11 @@ class PatternFixAgent(OkpMcpAgent):
                         "INTERMITTENT_FAILURE": "❌",
                         "CONSISTENTLY_FAILING": "❌",
                     }.get(classification.status.value, "❓")
-                    print(f"\n{emoji} {ticket}: {classification.status.value}")
+                    # Check if this is a no-doc ticket
+                    is_no_doc = ticket in no_doc_tickets
+                    no_doc_tag = " [NO-DOC]" if is_no_doc else ""
+
+                    print(f"\n{emoji} {ticket}: {classification.status.value}{no_doc_tag}")
                     print(f"   {classification.reason}")
                     print(
                         f"   Min/Max/Mean: {classification.min_score:.2f}/{classification.max_score:.2f}/{classification.mean_score:.2f}"
@@ -594,8 +718,11 @@ class PatternFixAgent(OkpMcpAgent):
                 high_priority_count = sum(
                     1 for c in ticket_classifications.values() if c.priority == "HIGH"
                 )
+                no_doc_count = len(no_doc_tickets)
 
                 print(f"   Total tickets:        {len(ticket_classifications)}")
+                if no_doc_count > 0:
+                    print(f"   🔍 No-doc tickets:    {no_doc_count} (answer-only evaluation)")
                 print(f"   ✅ Stable passing:    {stable_count} (will skip in optimization)")
                 print(f"   ⚠️  Unstable passing:  {unstable_pass_count} (will skip, needs review)")
                 print(f"   ❌ Borderline:        {borderline_count} (needs fixing)")
@@ -611,54 +738,121 @@ class PatternFixAgent(OkpMcpAgent):
                 if self.cleaned_config and self.cleaned_config.exists():
                     self.update_skip_tags(self.cleaned_config, ticket_classifications, mode="set")
                     print(f"   ✅ Skip tags updated in: {self.cleaned_config}")
+
+                    # Show which categories are being skipped
+                    skipped_stable = [
+                        tid
+                        for tid, cls in ticket_classifications.items()
+                        if cls.skip and cls.status.value == "STABLE_PASSING"
+                    ]
+                    skipped_no_doc = [tid for tid in skipped_stable if tid in no_doc_tickets]
+
+                    if skipped_stable:
+                        print(
+                            f"   📌 Skipping {len(skipped_stable)} stable-passing ticket(s) in optimization:"
+                        )
+                        if skipped_no_doc:
+                            print(
+                                f"      • {len(skipped_no_doc)} no-doc tickets (answered from LLM training)"
+                            )
+                        reg_skipped = len(skipped_stable) - len(skipped_no_doc)
+                        if reg_skipped > 0:
+                            print(f"      • {reg_skipped} regular tickets (already passing)")
                 else:
                     print(f"   ⚠️  Cleaned config not found: {self.cleaned_config}")
 
             # Calculate averaged metrics (for backward compatibility)
-            metrics = {
-                "url_f1": result.url_f1 or 0.0,
-                "mrr": result.mrr or 0.0,
-                "context_relevance": result.context_relevance or 0.0,
-                "context_precision": result.context_precision or 0.0,
-                "answer_correctness": result.answer_correctness or 0.0,
-                "faithfulness": result.faithfulness or 0.0,
-                "response_relevancy": result.response_relevancy or 0.0,
-                # NEW: Store classifications
-                "ticket_classifications": ticket_classifications,
-            }
+            # Handle both PatternEvaluationResult and EvaluationResult
+            if isinstance(result, PatternEvaluationResult):
+                # Pattern mode - use pattern-level aggregates
+                metrics = {
+                    "url_f1": result.pattern_url_f1,
+                    "mrr": 0.0,  # TODO: Calculate pattern-level MRR average
+                    "context_relevance": 0.0,  # TODO: Calculate from per-ticket results
+                    "context_precision": 0.0,  # TODO: Calculate from per-ticket results
+                    "answer_correctness": result.pattern_answer_correctness,
+                    "faithfulness": result.pattern_faithfulness,
+                    "response_relevancy": 0.0,  # TODO: Calculate from per-ticket results
+                    "ticket_classifications": ticket_classifications,
+                    "baseline_result": result,  # Store full pattern result
+                }
+                # Pattern-level RAG bypass: check if ANY ticket bypassed RAG
+                rag_bypassed = len(result.rag_bypass_tickets) > 0
+                num_docs = 0  # Pattern mode doesn't have single doc count
 
-            # Check RAG status
-            rag_bypassed = self._is_rag_bypassed(result)
-            num_docs = result.num_docs_retrieved() if hasattr(result, "num_docs_retrieved") else 0
+                print("\n📊 Baseline Metrics (Pattern Averages):")
+                print(f"   Runs:               {result.num_runs}")
+                print(f"   URL F1 (avg):       {metrics['url_f1']:.2f}")
+                print(f"   Answer (avg):       {metrics['answer_correctness']:.2f}")
+                print(f"   Faithfulness (avg): {metrics['faithfulness']:.2f}")
+                print(f"   Success Rate:       {result.success_rate:.0%}")
 
-            print("\n📊 Baseline Metrics:")
-            print(f"   Runs:               {result.num_runs}")
-            print(
-                f"   RAG Status:         {'❌ BYPASSED (0 docs)' if rag_bypassed else f'✅ Used ({num_docs} docs)'}"
-            )
-            print(f"   URL F1:             {metrics['url_f1']:.2f}")
-            print(f"   MRR:                {metrics['mrr']:.2f}")
-            print(f"   Context Relevance:  {metrics['context_relevance']:.2f}")
-            print(f"   Context Precision:  {metrics['context_precision']:.2f}")
-            print(f"   Answer Correctness: {metrics['answer_correctness']:.2f}")
-            print(f"   Faithfulness:       {metrics['faithfulness']:.2f}")
-            print(f"   Response Relevancy: {metrics['response_relevancy']:.2f}")
+                if result.rag_bypass_tickets:
+                    print(f"\n⚠️  RAG Bypass: {len(result.rag_bypass_tickets)} ticket(s)")
+                    for tid in result.rag_bypass_tickets[:3]:  # Show first 3
+                        print(f"      • {tid}")
 
-            # Check for high variance (instability)
-            if result.high_variance_metrics:
-                print("\n⚠️  HIGH VARIANCE DETECTED in baseline:")
-                for metric_info in result.high_variance_metrics:
-                    print(f"   • {metric_info}")
-                print("   → Baseline is UNSTABLE - optimization may not help")
+                if result.high_variance_tickets:
+                    print(f"\n⚠️  High Variance: {len(result.high_variance_tickets)} ticket(s)")
+                    for tid in result.high_variance_tickets[:3]:  # Show first 3
+                        print(f"      • {tid}")
 
-            # Determine problem type
-            is_retrieval = result.is_retrieval_problem
-            is_answer = result.is_answer_problem
+                # Pattern-level problem detection
+                # Check if ANY ticket has retrieval or answer problems
+                is_retrieval = any(
+                    tr.is_retrieval_problem for tr in result.per_ticket_results.values()
+                )
+                is_answer = any(tr.is_answer_problem for tr in result.per_ticket_results.values())
 
-            print("\n🔍 Problem Analysis:")
-            print(f"   RAG Bypassed:      {rag_bypassed}")
-            print(f"   Retrieval Problem: {is_retrieval}")
-            print(f"   Answer Problem:    {is_answer}")
+                print("\n🔍 Problem Analysis (Any Ticket):")
+                print(f"   Retrieval Problem: {is_retrieval}")
+                print(f"   Answer Problem:    {is_answer}")
+
+            else:
+                # Single ticket mode - use ticket-level attributes
+                metrics = {
+                    "url_f1": result.url_f1 or 0.0,
+                    "mrr": result.mrr or 0.0,
+                    "context_relevance": result.context_relevance or 0.0,
+                    "context_precision": result.context_precision or 0.0,
+                    "answer_correctness": result.answer_correctness or 0.0,
+                    "faithfulness": result.faithfulness or 0.0,
+                    "response_relevancy": result.response_relevancy or 0.0,
+                    "ticket_classifications": ticket_classifications,
+                }
+
+                # Check RAG status
+                rag_bypassed = self._is_rag_bypassed(result)
+                num_docs = result.num_docs_retrieved() if hasattr(result, "num_docs_retrieved") else 0
+
+                print("\n📊 Baseline Metrics:")
+                print(f"   Runs:               {result.num_runs}")
+                print(
+                    f"   RAG Status:         {'❌ BYPASSED (0 docs)' if rag_bypassed else f'✅ Used ({num_docs} docs)'}"
+                )
+                print(f"   URL F1:             {metrics['url_f1']:.2f}")
+                print(f"   MRR:                {metrics['mrr']:.2f}")
+                print(f"   Context Relevance:  {metrics['context_relevance']:.2f}")
+                print(f"   Context Precision:  {metrics['context_precision']:.2f}")
+                print(f"   Answer Correctness: {metrics['answer_correctness']:.2f}")
+                print(f"   Faithfulness:       {metrics['faithfulness']:.2f}")
+                print(f"   Response Relevancy: {metrics['response_relevancy']:.2f}")
+
+                # Check for high variance (instability)
+                if result.high_variance_metrics:
+                    print("\n⚠️  HIGH VARIANCE DETECTED in baseline:")
+                    for metric_info in result.high_variance_metrics:
+                        print(f"   • {metric_info}")
+                    print("   → Baseline is UNSTABLE - optimization may not help")
+
+                # Determine problem type
+                is_retrieval = result.is_retrieval_problem
+                is_answer = result.is_answer_problem
+
+                print("\n🔍 Problem Analysis:")
+                print(f"   RAG Bypassed:      {rag_bypassed}")
+                print(f"   Retrieval Problem: {is_retrieval}")
+                print(f"   Answer Problem:    {is_answer}")
 
             return PhaseResult(
                 phase_name="baseline",
@@ -700,6 +894,28 @@ class PatternFixAgent(OkpMcpAgent):
         # CRITICAL: Check RAG bypass FIRST
         if baseline_result and self._is_rag_bypassed(baseline_result):
             print("   RAG Bypassed: True (0 docs retrieved)")
+
+            # Check if this is a documentation gap
+            url_f1 = baseline_metrics.get("url_f1", 0.0)
+            if url_f1 == 0.0:
+                print("\n❌ DOCUMENTATION GAP DETECTED:")
+                print("   → Expected URLs in config but 0 docs retrieved")
+                print("   → This indicates:")
+                print("      • Documentation missing from Solr/OKP index")
+                print("      • OR expected_urls in YAML are wrong")
+                print("      • OR query doesn't match indexed docs")
+                print("\n   ⚠️  CANNOT FIX via RAG optimization")
+                print("   📋 REQUIRED ACTIONS:")
+                print("      1. Verify docs exist in Solr index")
+                print("      2. Check expected_urls match actual doc IDs")
+                print("      3. Add missing documentation if needed")
+                print("      4. Quarantine ticket for SME review")
+                return PhaseResult(
+                    phase_name="optimization",
+                    success=False,
+                    reason="Documentation gap - expected docs not in index",
+                )
+
             print("\n📍 Route C: RAG BYPASS - PROMPT OPTIMIZATION")
             print("   Issue: System chose not to use RAG or RAG returned 0 docs")
             print("   Testing: Force RAG usage via system prompt changes")
@@ -721,7 +937,7 @@ class PatternFixAgent(OkpMcpAgent):
             print("   Testing: Solr config changes (qf, pf, mm, highlighting, etc.)")
             print("   Mode: Retrieval-only (no response generation)")
             print("   Speed: ~15-20 sec/iteration")
-            return self.run_retrieval_optimization(ticket_id, baseline_metrics, max_iterations)
+            return self.run_retrieval_optimization(ticket_id, baseline_metrics, max_iterations, baseline_result)
         elif is_answer:
             # Route B: Prompt optimization (system prompt changes)
             print("\n📍 Route B: PROMPT OPTIMIZATION")
@@ -731,20 +947,25 @@ class PatternFixAgent(OkpMcpAgent):
             return self.run_prompt_optimization(ticket_id, baseline_metrics, max_iterations)
         else:
             print("\n⚠️  No clear problem identified - trying retrieval optimization")
-            return self.run_retrieval_optimization(ticket_id, baseline_metrics, max_iterations)
+            return self.run_retrieval_optimization(ticket_id, baseline_metrics, max_iterations, baseline_result)
 
     def run_retrieval_optimization(
-        self, ticket_id: Optional[str], baseline_metrics: Dict, max_iterations: int
+        self, ticket_id: Optional[str], baseline_metrics: Dict, max_iterations: int, baseline_result: Any = None
     ) -> PhaseResult:
         """Route A: Fast retrieval optimization (Solr config changes).
 
-        Uses retrieval-only mode - NO response generation needed.
-        Tests: qf boosting, pf phrase matching, mm, highlighting, field weights.
+        Uses the parent class's optimize_solr_retrieval() method which:
+        1. Gets suggestions from Solr Expert
+        2. Applies changes to Solr config
+        3. Restarts container (CRITICAL!)
+        4. Tests the change
+        5. Commits if improved
 
         Args:
             ticket_id: Ticket to optimize
             baseline_metrics: Baseline metrics
             max_iterations: Max iterations
+            baseline_result: Full baseline result (PatternEvaluationResult for pattern mode)
 
         Returns:
             PhaseResult with optimization outcome
@@ -752,76 +973,426 @@ class PatternFixAgent(OkpMcpAgent):
         print(f"   Max iterations: {max_iterations}")
         print("   Early exit: F1 > 0 (any expected docs found)\n")
 
+        # Full-pattern mode: Pattern-wide optimization (NOT sequential per-ticket!)
+        if not ticket_id:
+            return self._run_pattern_wide_retrieval_optimization(
+                baseline_result, baseline_metrics, max_iterations
+            )
+
+        # Load pattern YAML to get ticket details
+        pattern_file = Path(f"config/patterns/{self.pattern_id}.yaml")
+        with open(pattern_file) as f:
+            content = f.read()
+            lines = [line for line in content.split("\n") if not line.startswith("#")]
+            yaml_content = "\n".join(lines)
+            conversations = yaml.safe_load(yaml_content)
+
+        # Find the conversation for this ticket
+        conversation = None
+        for conv in conversations:
+            if conv.get("conversation_group_id") == ticket_id:
+                conversation = conv
+                break
+
+        if not conversation:
+            raise ValueError(f"Ticket {ticket_id} not found in pattern {self.pattern_id}")
+
+        # Get first turn (assuming single-turn for now)
+        turns = conversation.get("turns", [])
+        if not turns:
+            raise ValueError(f"No turns found for ticket {ticket_id}")
+
+        first_turn = turns[0]
+        query = first_turn.get("query", "")
+        expected_urls = first_turn.get("expected_urls", [])
+
         try:
-            iteration = 0
-            current_f1 = baseline_metrics.get("url_f1", 0.0)
-            current_ctx_rel = baseline_metrics.get("context_relevance", 0.0)
+            # Call parent class's fast retrieval loop
+            # This handles: get suggestion → apply change → restart → test → commit
+            self.fast_retrieval_loop(
+                ticket_id=ticket_id,
+                query=query,
+                expected_urls=expected_urls,
+                max_iterations=max_iterations,
+            )
 
-            while iteration < max_iterations:
-                iteration += 1
-                print(f"\n{'='*80}")
-                print(f"📍 OPTIMIZATION ITERATION {iteration}/{max_iterations}")
-                print(
-                    f"   Current scores → F1: {current_f1:.2f}, Context Rel: {current_ctx_rel:.2f}"
-                )
-                print(f"{'='*80}")
+            # Get final metrics by running one more test
+            result = self.diagnose_retrieval_only(ticket_id, iteration=max_iterations + 1)
 
-                # Use retrieval-only mode (faster, no LLM response generation)
-                result = self.diagnose_retrieval_only(ticket_id, iteration=iteration)
-
-                new_f1 = result.url_f1 or 0.0
-                new_ctx_rel = result.context_relevance or 0.0
-
-                print(f"\n   📊 Results → F1: {new_f1:.2f}, Context Rel: {new_ctx_rel:.2f}")
-
-                if new_f1 > current_f1:
-                    print(f"   ✅ F1 improved: {current_f1:.2f} → {new_f1:.2f}")
-                    current_f1 = new_f1
-                else:
-                    print(f"   ➡️  F1 unchanged: {current_f1:.2f}")
-
-                if new_ctx_rel > current_ctx_rel:
-                    print(
-                        f"   ✅ Context Relevance improved: {current_ctx_rel:.2f} → {new_ctx_rel:.2f}"
-                    )
-                    current_ctx_rel = new_ctx_rel
-                else:
-                    print(f"   ➡️  Context Relevance unchanged: {current_ctx_rel:.2f}")
-
-                # Early exit if we found ANY expected docs
-                # F1 can be "low" (e.g., 0.4) but still have all right docs
-                # Example: 3 expected docs, 10 retrieved (with all 3) → F1=0.46
-                # Don't keep optimizing - test answer instead!
-                if current_f1 > 0.0:
-                    print("\n🎯 EARLY EXIT: Found expected docs!")
-                    print(f"   F1: {current_f1:.2f} (may be 'low' due to extra docs retrieved)")
-                    print(f"   Context Relevance: {current_ctx_rel:.2f}")
-                    print("   → Stopping optimization to test answer quality")
-                    break
+            final_f1 = result.url_f1 or 0.0
+            final_ctx_rel = result.context_relevance or 0.0
 
             final_metrics = {
-                "url_f1": current_f1,
-                "context_relevance": current_ctx_rel,
+                "url_f1": final_f1,
+                "context_relevance": final_ctx_rel,
             }
 
-            improved = current_f1 > baseline_metrics.get("url_f1", 0.0)
+            improved = final_f1 > baseline_metrics.get("url_f1", 0.0)
 
             return PhaseResult(
                 phase_name="retrieval_optimization",
                 success=improved,
-                iterations=iteration,
+                iterations=max_iterations,
                 final_metrics=final_metrics,
-                reason=f"F1: {baseline_metrics.get('url_f1', 0):.2f} → {current_f1:.2f}",
+                reason=f"F1: {baseline_metrics.get('url_f1', 0):.2f} → {final_f1:.2f}",
             )
 
         except Exception as e:
             print(f"❌ Retrieval optimization failed: {e}")
+            import traceback
+
+            traceback.print_exc()
             return PhaseResult(
                 phase_name="retrieval_optimization",
                 success=False,
-                iterations=iteration,
+                iterations=0,
                 reason=str(e),
             )
+
+    def _run_pattern_wide_retrieval_optimization(
+        self,
+        baseline_result: PatternEvaluationResult,
+        baseline_metrics: Dict,
+        max_iterations: int,
+    ) -> PhaseResult:
+        """Pattern-wide retrieval optimization - ONE change tested on ALL tickets.
+
+        This is the correct pattern-based approach:
+        1. Get baseline scores for ALL tickets
+        2. Get ONE Solr suggestion considering ALL failing tickets together
+        3. Apply change ONCE
+        4. Test ALL tickets
+        5. Show pattern-wide impact (which improved, which regressed)
+        6. Commit if net positive
+        7. Repeat for max_iterations
+
+        Args:
+            baseline_result: Pattern baseline with per-ticket results
+            baseline_metrics: Pattern-level baseline metrics
+            max_iterations: Max optimization iterations
+
+        Returns:
+            PhaseResult with pattern-wide optimization outcome
+        """
+        print("🔄 Full-pattern mode: Pattern-wide retrieval optimization")
+        print(f"   Strategy: ONE change tested on ALL {len(baseline_result.per_ticket_results)} tickets")
+        print(f"   Max iterations: {max_iterations}\n")
+
+        # Load pattern YAML to get all ticket details
+        pattern_file = Path(f"config/patterns/{self.pattern_id}.yaml")
+        with open(pattern_file) as f:
+            content = f.read()
+            lines = [line for line in content.split("\n") if not line.startswith("#")]
+            yaml_content = "\n".join(lines)
+            conversations = yaml.safe_load(yaml_content)
+
+        # Build ticket lookup: {ticket_id: {query, expected_urls}}
+        ticket_queries = {}
+        for conv in conversations:
+            tid = conv.get("conversation_group_id")
+            turns = conv.get("turns", [])
+            if tid and turns:
+                first_turn = turns[0]
+                ticket_queries[tid] = {
+                    "query": first_turn.get("query", ""),
+                    "expected_urls": first_turn.get("expected_urls", []),
+                }
+
+        # Identify tickets with retrieval problems
+        failing_tickets = [
+            tid
+            for tid, tres in baseline_result.per_ticket_results.items()
+            if tres.is_retrieval_problem and tid in ticket_queries
+        ]
+
+        if not failing_tickets:
+            print("✅ No tickets have retrieval problems")
+            return PhaseResult(
+                phase_name="retrieval_optimization",
+                success=True,
+                iterations=0,
+                final_metrics=baseline_metrics,
+                reason="No retrieval problems detected",
+            )
+
+        print(f"   Found {len(failing_tickets)} tickets with retrieval problems:")
+        for tid in failing_tickets:
+            tres = baseline_result.per_ticket_results[tid]
+            print(f"     • {tid}: F1={tres.url_f1:.2f}, MRR={tres.mrr or 0:.2f}")
+        print()
+
+        # Pattern-wide optimization loop
+        print(f"{'='*80}")
+        print("PATTERN-WIDE RETRIEVAL OPTIMIZATION")
+        print(f"{'='*80}\n")
+
+        best_pattern_f1 = baseline_result.pattern_url_f1
+        iteration_count = 0
+        commits_made = 0
+        iterations_without_improvement = 0
+        max_iterations_without_improvement = 3  # Exit if stuck for 3 iterations
+
+        for iteration in range(1, max_iterations + 1):
+            print(f"\n--- Pattern Iteration {iteration}/{max_iterations} ---\n")
+
+            # Get ONE Solr suggestion considering ALL failing tickets
+            # Use the first failing ticket as representative
+            representative_ticket = failing_tickets[0]
+            rep_query = ticket_queries[representative_ticket]["query"]
+            rep_urls = ticket_queries[representative_ticket]["expected_urls"]
+
+            # Get baseline for representative ticket
+            baseline_rep = baseline_result.per_ticket_results[representative_ticket]
+
+            # Get suggestion using multi-agent system (if available)
+            if self.multi_agent:
+                print("🤖 Consulting multi-agent system (Solr Expert + Code Expert)...\n")
+
+                try:
+                    # Multi-agent approach: Solr theory + code analysis
+                    synthesized = self._run_async_in_thread(
+                        self.multi_agent.get_optimized_suggestion(
+                            query=rep_query,
+                            expected_urls=rep_urls,
+                            retrieved_urls=[],  # TODO: Extract from baseline
+                            metrics={
+                                "url_f1": baseline_rep.url_f1 or 0.0,
+                                "mrr": baseline_rep.mrr or 0.0,
+                            },
+                            solr_explain=None,  # TODO: Get from solr_analyzer
+                        )
+                    )
+
+                    print(f"🔍 Solr Expert + Code Expert Analysis Complete")
+                    print(f"   Confidence: {synthesized.confidence:.0%}")
+                    if synthesized.risks:
+                        print(f"   Risks: {', '.join(synthesized.risks[:2])}")
+                    print()
+
+                    # Convert to compatible suggestion format
+                    from dataclasses import dataclass
+
+                    @dataclass
+                    class MultiAgentSuggestion:
+                        suggested_change: str
+                        file_path: str
+                        old_code: str
+                        new_code: str
+                        reasoning: str
+
+                    suggestion = MultiAgentSuggestion(
+                        suggested_change=synthesized.suggested_change,
+                        file_path=synthesized.file_path,
+                        old_code=synthesized.old_code,
+                        new_code=synthesized.new_code,
+                        reasoning=synthesized.reasoning,
+                    )
+
+                except Exception as e:
+                    print(f"⚠️  Multi-agent system failed: {e}")
+                    print("   Falling back to single-agent mode\n")
+                    self.multi_agent = None  # Disable for rest of session
+                    suggestion = None
+
+            # Fallback to single-agent mode
+            if not self.multi_agent or not suggestion:
+                print("🤖 Using single-agent mode (fallback)...\n")
+
+                from dataclasses import dataclass
+
+                @dataclass
+                class MinimalResult:
+                    ticket_id: str
+                    query: str
+                    url_f1: float
+                    mrr: float
+                    expected_urls: List[str]
+                    retrieved_urls: List[str]
+                    is_retrieval_problem: bool = True
+
+                minimal_result = MinimalResult(
+                    ticket_id=representative_ticket,
+                    query=rep_query,
+                    url_f1=baseline_rep.url_f1 or 0.0,
+                    mrr=baseline_rep.mrr or 0.0,
+                    expected_urls=rep_urls,
+                    retrieved_urls=[],
+                )
+
+                # Load Solr config snapshot
+                solr_snapshot = self.load_solr_config_snapshot(representative_ticket)
+                if not solr_snapshot:
+                    solr_snapshot = self.extract_solr_config_snapshot(representative_ticket)
+
+                # Get suggestion from single LLM
+                suggestion = self._get_llm_suggestion_object(
+                    minimal_result,
+                    model=TIER_MODELS["medium"],
+                    iteration_history=[],
+                    solr_snapshot=solr_snapshot,
+                )
+
+            if not suggestion:
+                print("❌ Failed to get suggestion")
+                continue
+
+            print(f"💡 Suggestion: {suggestion.suggested_change}\n")
+
+            # Apply change
+            if not self.apply_code_change(suggestion, iteration_context=f"Pattern Iteration {iteration}"):
+                print("❌ Change not applied")
+                continue
+
+            # Restart okp-mcp
+            print("🔄 Restarting okp-mcp...")
+            self.restart_okp_mcp()
+
+            # TEST ALL TICKETS IN PATTERN
+            print(f"\n📊 Testing ALL {len(ticket_queries)} tickets in pattern...\n")
+
+            pattern_scores = {}
+            for tid in ticket_queries.keys():
+                try:
+                    # Test this ticket
+                    query = ticket_queries[tid]["query"]
+                    expected_urls = ticket_queries[tid]["expected_urls"]
+
+                    if not expected_urls:
+                        print(f"   ⚠️  {tid}: No expected_urls, skipping")
+                        continue
+
+                    # Query Solr directly for fast testing
+                    current = self.query_solr_direct(query, expected_urls)
+
+                    if "error" not in current:
+                        pattern_scores[tid] = {
+                            "url_f1": current["url_f1"],
+                            "mrr": current["mrr"],
+                        }
+                except Exception as e:
+                    print(f"   ❌ {tid}: Error testing: {e}")
+
+            # Show pattern-wide impact
+            print(f"\n{'='*80}")
+            print("PATTERN-WIDE IMPACT")
+            print(f"{'='*80}")
+            print(f"{'Ticket':<20} {'Baseline F1':<12} {'Current F1':<12} {'Change':<12} {'Status'}")
+            print("-" * 80)
+
+            improved_count = 0
+            regressed_count = 0
+            unchanged_count = 0
+            total_f1_delta = 0.0
+
+            for tid in sorted(pattern_scores.keys()):
+                current_f1 = pattern_scores[tid]["url_f1"]
+                baseline_f1 = baseline_result.per_ticket_results[tid].url_f1 or 0.0
+                delta = current_f1 - baseline_f1
+
+                if delta > 0.05:
+                    status = "✅ IMPROVED"
+                    improved_count += 1
+                elif delta < -0.05:
+                    status = "❌ REGRESSED"
+                    regressed_count += 1
+                else:
+                    status = "  UNCHANGED"
+                    unchanged_count += 1
+
+                total_f1_delta += delta
+
+                print(
+                    f"{tid:<20} {baseline_f1:>11.2f} {current_f1:>11.2f} {delta:>+11.2f} {status}"
+                )
+
+            print("-" * 80)
+            print(
+                f"{'SUMMARY':<20} {'':<12} {'':<12} {total_f1_delta:>+11.2f} "
+                f"({improved_count} improved, {regressed_count} regressed, {unchanged_count} unchanged)"
+            )
+            print(f"{'='*80}\n")
+
+            # Decision: Commit if net positive (more improved than regressed)
+            if improved_count > regressed_count:
+                print(f"✅ Net positive! Committing change ({improved_count} improved > {regressed_count} regressed)")
+                import subprocess
+
+                subprocess.run(["git", "add", "src/okp_mcp/solr.py"], cwd=self.okp_mcp_root, check=True)
+                subprocess.run(
+                    ["git", "commit", "-m", f"pattern: {suggestion.suggested_change}"],
+                    cwd=self.okp_mcp_root,
+                    check=True,
+                )
+                commits_made += 1
+                iteration_count += 1
+
+                # Update best pattern F1
+                avg_f1 = sum(s["url_f1"] for s in pattern_scores.values()) / len(pattern_scores)
+                if avg_f1 > best_pattern_f1:
+                    best_pattern_f1 = avg_f1
+                    iterations_without_improvement = 0  # Reset counter - we improved!
+                else:
+                    iterations_without_improvement += 1
+
+                # EARLY EXIT: Check if we've solved the pattern
+                # Count how many tickets are now "good enough" (F1 > 0.5)
+                passing_tickets = sum(1 for s in pattern_scores.values() if s["url_f1"] >= 0.5)
+                total_tickets = len(pattern_scores)
+                success_rate = passing_tickets / total_tickets if total_tickets > 0 else 0.0
+
+                print(f"\n📊 Pattern Status: {passing_tickets}/{total_tickets} tickets passing (F1 ≥ 0.5)")
+
+                # Exit early if 80%+ of tickets are passing
+                if success_rate >= 0.8:
+                    print(f"\n🎉 SUCCESS! Pattern solved: {success_rate:.0%} of tickets passing")
+                    print(f"   Early exit at iteration {iteration}/{max_iterations}")
+                    break
+
+                # Exit early if ALL tickets have F1 > 0 (at least finding some docs)
+                if all(s["url_f1"] > 0 for s in pattern_scores.values()):
+                    print(f"\n✅ All tickets finding expected docs (F1 > 0)")
+                    print(f"   Early exit at iteration {iteration}/{max_iterations}")
+                    break
+
+                # Exit early if stuck (no improvement for N iterations)
+                if iterations_without_improvement >= max_iterations_without_improvement:
+                    print(f"\n⚠️  No improvement for {iterations_without_improvement} iterations")
+                    print(f"   Early exit at iteration {iteration}/{max_iterations}")
+                    break
+
+            else:
+                print(f"❌ Net negative - reverting ({improved_count} improved ≤ {regressed_count} regressed)")
+                import subprocess
+
+                subprocess.run(["git", "restore", "src/okp_mcp/solr.py"], cwd=self.okp_mcp_root)
+                self.restart_okp_mcp()
+                iterations_without_improvement += 1  # Count reverts as no improvement
+
+                # Exit early if stuck after too many reverts
+                if iterations_without_improvement >= max_iterations_without_improvement:
+                    print(f"\n⚠️  No improvement for {iterations_without_improvement} iterations")
+                    print(f"   Early exit at iteration {iteration}/{max_iterations}")
+                    break
+
+        # Final summary
+        print(f"\n{'='*80}")
+        print("PATTERN OPTIMIZATION COMPLETE")
+        print(f"{'='*80}")
+        print(f"   Iterations attempted: {max_iterations}")
+        print(f"   Changes committed: {commits_made}")
+        print(f"   Best pattern F1: {best_pattern_f1:.2f}")
+        print(f"{'='*80}\n")
+
+        return PhaseResult(
+            phase_name="retrieval_optimization",
+            success=commits_made > 0,
+            iterations=iteration_count,
+            final_metrics={
+                "pattern_f1": best_pattern_f1,
+                "commits_made": commits_made,
+            },
+            reason=f"Pattern-wide optimization: {commits_made} changes committed",
+        )
 
     def run_prompt_optimization(
         self, ticket_id: Optional[str], baseline_metrics: Dict, max_iterations: int
@@ -1052,15 +1623,46 @@ class PatternFixAgent(OkpMcpAgent):
             # Run full diagnosis with all metrics (skip tags removed)
             result = self.diagnose(ticket_id, use_existing=False, runs=stability_runs)
 
-            # Check metrics
+            # Get per-ticket results for detailed analysis
+            output_dir = self.get_latest_output_dir("full")
+            per_ticket_results = self.parse_results_per_ticket(output_dir)
+
+            # Create PatternEvaluation object with baseline for comparison
+            pattern_eval = PatternEvaluation(
+                pattern_id=self.pattern_id, baseline=self._baseline_pattern
+            )
+
+            # Build lookup of no-doc tickets
+            no_doc_tickets = {
+                t["ticket_id"] for t in self.pattern_tickets if not t.get("has_expected_urls", True)
+            }
+
+            for ticket_id, runs in per_ticket_results.items():
+                # Get baseline for this ticket if available
+                baseline_ticket = None
+                if self._baseline_pattern and ticket_id in self._baseline_pattern.tickets:
+                    baseline_ticket = self._baseline_pattern.tickets[ticket_id]
+
+                # Check if this is a no-doc ticket
+                is_no_doc = ticket_id in no_doc_tickets
+
+                ticket_eval = TicketEvaluation(
+                    ticket_id=ticket_id, runs=runs, baseline=baseline_ticket, is_no_doc=is_no_doc
+                )
+                pattern_eval.tickets[ticket_id] = ticket_eval
+
+            # Check overall averaged metrics
             answer_correct = result.answer_correctness or 0.0
             faithful = result.faithfulness or 0.0
             url_f1 = result.url_f1 or 0.0
 
-            print("\n📊 Final Validation Metrics:")
+            print("\n📊 Final Validation Metrics (Pattern Average):")
             print(f"   Answer Correctness: {answer_correct:.2f} (avg of {result.num_runs} runs)")
             print(f"   Faithfulness:       {faithful:.2f}")
             print(f"   URL F1:             {url_f1:.2f}")
+
+            # Print per-ticket breakdown
+            self._print_per_ticket_progress(pattern_eval, stability_runs)
 
             # Check for high variance (instability)
             if result.high_variance_metrics:
@@ -1069,22 +1671,63 @@ class PatternFixAgent(OkpMcpAgent):
                     print(f"   • {metric_info}")
                 print("   → Pattern fix may not be stable")
 
-            # Calculate composite score (weights: answer 40%, context relevance 30%, precision 15%, keywords 10%, forbidden 5%)
+            # Calculate composite scores per ticket using PatternEvaluation
+            ticket_composites = self._calculate_per_ticket_composites(pattern_eval)
+
+            # Calculate pattern-level composite (for reference)
             composite_score = self._calculate_composite_metric(result)
             COMPOSITE_THRESHOLD = 0.80  # High quality across all metrics
 
-            passing = composite_score >= COMPOSITE_THRESHOLD
+            # Use PatternEvaluation to determine pass/fail
+            passing = pattern_eval.passes(criteria="majority")  # >50% of tickets
+            passing_tickets = pattern_eval.passing_tickets
+            failing_tickets = pattern_eval.failing_tickets
+            total_tickets = pattern_eval.num_tickets
 
             if passing:
-                print(f"\n✅ Final pattern validation PASSED")
-                print(f"   Composite Score: {composite_score:.2f} (≥ {COMPOSITE_THRESHOLD:.2f})")
-                print("   → All tickets validated")
-                print("   → No regressions detected")
-                print("   → Fixes are stable")
+                print("\n✅ Final pattern validation PASSED")
+                print(
+                    f"   Passing Tickets: {len(passing_tickets)}/{total_tickets} (>{total_tickets/2:.0f} required)"
+                )
+                print(f"   Success Rate: {pattern_eval.success_rate:.1%}")
+                print(
+                    f"   Pattern Composite: {composite_score:.2f} (threshold: {COMPOSITE_THRESHOLD:.2f})"
+                )
+                print("\n   ✅ Passing tickets:")
+                for ticket_id in passing_tickets:
+                    ticket_eval = pattern_eval.tickets[ticket_id]
+                    print(
+                        f"      {ticket_id}: composite={ticket_eval.composite_score:.2f}, status={ticket_eval.status}"
+                    )
+
+                if failing_tickets:
+                    print("\n   ❌ Still failing (but majority passed):")
+                    for ticket_id in failing_tickets:
+                        ticket_eval = pattern_eval.tickets[ticket_id]
+                        print(
+                            f"      {ticket_id}: composite={ticket_eval.composite_score:.2f}, status={ticket_eval.status}"
+                        )
             else:
-                print(f"\n❌ Final pattern validation FAILED")
-                print(f"   Composite Score: {composite_score:.2f} < {COMPOSITE_THRESHOLD:.2f}")
-                print("\n   Metric Breakdown:")
+                print("\n❌ Final pattern validation FAILED")
+                print(
+                    f"   Passing Tickets: {len(passing_tickets)}/{total_tickets} (need >{total_tickets/2:.0f})"
+                )
+                print(f"   Success Rate: {pattern_eval.success_rate:.1%}")
+                print(f"   Pattern Composite: {composite_score:.2f} (avg)")
+
+                print("\n   Per-Ticket Composites:")
+                for ticket_id in sorted(
+                    pattern_eval.tickets.keys(),
+                    key=lambda tid: pattern_eval.tickets[tid].composite_score,
+                    reverse=True,
+                ):
+                    ticket_eval = pattern_eval.tickets[ticket_id]
+                    status_emoji = "✅" if ticket_eval.passes() else "❌"
+                    print(
+                        f"   {status_emoji} {ticket_id}: {ticket_eval.composite_score:.2f} (status={ticket_eval.status})"
+                    )
+
+                print("\n   Pattern Average Breakdown:")
                 if answer_correct < 0.90:
                     print(f"   • Answer correctness: {answer_correct:.2f} (target: ≥0.90)")
                 else:
@@ -1107,8 +1750,11 @@ class PatternFixAgent(OkpMcpAgent):
                     "answer_correctness": answer_correct,
                     "faithfulness": faithful,
                     "url_f1": url_f1,
+                    "per_ticket_composites": ticket_composites,
+                    "passing_tickets": passing_tickets,
+                    "total_tickets": total_tickets,
                 },
-                reason=f"All tickets validated, composite_score={composite_score:.2f}, passing={passing}",
+                reason=f"Pattern validation: {len(passing_tickets)}/{total_tickets} tickets passing, composite={composite_score:.2f}",
             )
 
         except Exception as e:
@@ -1335,6 +1981,99 @@ class PatternFixAgent(OkpMcpAgent):
         print("   Human review required - check diagnostics for root cause")
         # Future: implement automated analysis from docs/VARIANCE_SOLUTIONS.md
 
+    def _print_per_ticket_progress(self, pattern_eval: PatternEvaluation, num_runs: int) -> None:
+        """Print per-ticket progress across evaluation runs.
+
+        Args:
+            pattern_eval: PatternEvaluation with ticket results
+            num_runs: Number of runs executed
+        """
+        print(f"\n📊 Per-Ticket Progress ({num_runs} runs):")
+        print("=" * 80)
+
+        for ticket_id in sorted(pattern_eval.tickets.keys()):
+            ticket_eval = pattern_eval.tickets[ticket_id]
+
+            if not ticket_eval.runs:
+                continue
+
+            # Extract answer_correctness across runs
+            ans_scores = [r.get("answer_correctness", 0.0) for r in ticket_eval.runs]
+            min_score = min(ans_scores)
+            max_score = max(ans_scores)
+            mean_score = ticket_eval.mean_answer_correctness
+            std_dev = ticket_eval.variance**0.5  # Convert variance to std dev
+
+            # Check for baseline comparison
+            baseline_ticket = None
+            improvement = None
+            if self._baseline_pattern and ticket_id in self._baseline_pattern.tickets:
+                baseline_ticket = self._baseline_pattern.tickets[ticket_id]
+                improvement = ticket_eval.improvement_over_baseline()
+
+            # Determine status using TicketEvaluation.status property
+            status_val = ticket_eval.status
+
+            # Map status to emoji and display text
+            status_map = {
+                "STABLE_PASSING": ("✅", "✅ STABLE"),
+                "CONSISTENTLY_FAILING": ("❌", "❌ FAILING"),
+                "IMPROVING": ("📈", "📈 IMPROVING"),
+                "REGRESSING": ("📉", "📉 REGRESSING"),
+                "ERRATIC": ("❌", "❌ ERRATIC"),
+                "IN_PROGRESS": ("⚠️", "⚠️  IN PROGRESS"),
+                "NO_DATA": ("❓", "❓ NO DATA"),
+            }
+
+            emoji, status = status_map.get(status_val, ("❓", f"❓ {status_val}"))
+
+            # Build run progression string
+            if len(ans_scores) <= 3:
+                progression = " → ".join(f"{s:.2f}" for s in ans_scores)
+            else:
+                progression = f"{ans_scores[0]:.2f} → ... → {ans_scores[-1]:.2f}"
+
+            # Print summary
+            print(f"\n{emoji} {ticket_id}: {status}")
+            if baseline_ticket is not None:
+                baseline_score = baseline_ticket.mean_answer_correctness
+                print(
+                    f"   Baseline→Final: {baseline_score:.2f} → {mean_score:.2f} ({improvement:+.2f})"
+                )
+            print(f"   Runs: {progression}")
+            print(
+                f"   Mean: {mean_score:.2f}, Std: {std_dev:.2f}, Range: {min_score:.2f}-{max_score:.2f}"
+            )
+
+            # Show other key metrics from latest run
+            if ticket_eval.runs:
+                latest = ticket_eval.runs[-1]
+                faith = latest.get("faithfulness", 0.0)
+                url_f1 = latest.get("url_f1", 0.0)
+                ctx_rel = latest.get("context_relevance", 0.0)
+                print(
+                    f"   Latest: faithfulness={faith:.2f}, url_f1={url_f1:.2f}, ctx_rel={ctx_rel:.2f}"
+                )
+
+        print("=" * 80)
+
+    def _calculate_per_ticket_composites(self, pattern_eval: PatternEvaluation) -> Dict[str, float]:
+        """Calculate composite score for each ticket (averaged across runs).
+
+        Args:
+            pattern_eval: PatternEvaluation with ticket results
+
+        Returns:
+            Dict mapping ticket_id → composite_score
+        """
+        ticket_composites = {}
+
+        for ticket_id, ticket_eval in pattern_eval.tickets.items():
+            # Use TicketEvaluation's built-in composite_score property
+            ticket_composites[ticket_id] = ticket_eval.composite_score
+
+        return ticket_composites
+
     def _print_improvement_summary(self, result: PatternFixResult) -> None:
         """Print improvement summary showing metric trends across phases.
 
@@ -1347,7 +2086,6 @@ class PatternFixAgent(OkpMcpAgent):
 
         # Extract metrics from each phase
         baseline_metrics = result.baseline.final_metrics if result.baseline else {}
-        opt_metrics = result.optimization.final_metrics if result.optimization else {}
         final_metrics = result.stability.final_metrics if result.stability else {}
 
         # Calculate composite scores for each phase
@@ -1362,27 +2100,35 @@ class PatternFixAgent(OkpMcpAgent):
         final_ans = final_metrics.get("answer_correctness", 0.0)
         ans_change = final_ans - baseline_ans
         ans_arrow = "→" if abs(ans_change) < 0.01 else ("↗" if ans_change > 0 else "↘")
-        print(f"│  Answer Correctness:  {baseline_ans:.2f} {ans_arrow} {final_ans:.2f}  ({ans_change:+.2f})       │")
+        print(
+            f"│  Answer Correctness:  {baseline_ans:.2f} {ans_arrow} {final_ans:.2f}  ({ans_change:+.2f})       │"
+        )
 
         # Faithfulness
         baseline_faith = baseline_metrics.get("faithfulness", 0.0)
         final_faith = final_metrics.get("faithfulness", 0.0)
         faith_change = final_faith - baseline_faith
         faith_arrow = "→" if abs(faith_change) < 0.01 else ("↗" if faith_change > 0 else "↘")
-        print(f"│  Faithfulness:        {baseline_faith:.2f} {faith_arrow} {final_faith:.2f}  ({faith_change:+.2f})       │")
+        print(
+            f"│  Faithfulness:        {baseline_faith:.2f} {faith_arrow} {final_faith:.2f}  ({faith_change:+.2f})       │"
+        )
 
         # URL F1
         baseline_url = baseline_metrics.get("url_f1", 0.0)
         final_url = final_metrics.get("url_f1", 0.0)
         url_change = final_url - baseline_url
         url_arrow = "→" if abs(url_change) < 0.01 else ("↗" if url_change > 0 else "↘")
-        print(f"│  URL F1:              {baseline_url:.2f} {url_arrow} {final_url:.2f}  ({url_change:+.2f})       │")
+        print(
+            f"│  URL F1:              {baseline_url:.2f} {url_arrow} {final_url:.2f}  ({url_change:+.2f})       │"
+        )
 
         # Composite Score (if available)
         if baseline_composite is not None and final_composite is not None:
             comp_change = final_composite - baseline_composite
             comp_arrow = "→" if abs(comp_change) < 0.01 else ("↗" if comp_change > 0 else "↘")
-            print(f"│  Composite Score:     {baseline_composite:.2f} {comp_arrow} {final_composite:.2f}  ({comp_change:+.2f})       │")
+            print(
+                f"│  Composite Score:     {baseline_composite:.2f} {comp_arrow} {final_composite:.2f}  ({comp_change:+.2f})       │"
+            )
 
         print("│                                                              │")
         print("└──────────────────────────────────────────────────────────────┘")
@@ -1403,9 +2149,13 @@ class PatternFixAgent(OkpMcpAgent):
         if final_composite is not None:
             threshold = 0.80
             if final_composite >= threshold:
-                print(f"│  Composite score {final_composite:.2f} meets threshold {threshold:.2f}           │")
+                print(
+                    f"│  Composite score {final_composite:.2f} meets threshold {threshold:.2f}           │"
+                )
             else:
-                print(f"│  Composite score {final_composite:.2f} below threshold {threshold:.2f}          │")
+                print(
+                    f"│  Composite score {final_composite:.2f} below threshold {threshold:.2f}          │"
+                )
 
         print("│                                                              │")
         print("└──────────────────────────────────────────────────────────────┘")
