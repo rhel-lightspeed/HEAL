@@ -15,7 +15,7 @@ import pytest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from heal.core.solr_expert import SolrExpertAgent, VerificationQuery
+from heal.agents.solr_expert import SolrExpertAgent, VerificationQuery
 from heal.core.search_intelligence import SearchIntelligenceManager
 
 

@@ -42,9 +42,7 @@ async def load_baseline_metrics(fixture_path: Path) -> Dict[str, float]:
 
         # Average answer_correctness across runs for this ticket
         answer_values = [
-            r.get("answer_correctness")
-            for r in runs
-            if r.get("answer_correctness") is not None
+            r.get("answer_correctness") for r in runs if r.get("answer_correctness") is not None
         ]
         if answer_values:
             avg_answer = sum(answer_values) / len(answer_values)
@@ -52,11 +50,7 @@ async def load_baseline_metrics(fixture_path: Path) -> Dict[str, float]:
             print(f"  Baseline {ticket_id}: Answer={avg_answer:.2f}")
 
         # Average url_f1 across runs for this ticket
-        url_f1_values = [
-            r.get("url_f1")
-            for r in runs
-            if r.get("url_f1") is not None
-        ]
+        url_f1_values = [r.get("url_f1") for r in runs if r.get("url_f1") is not None]
         if url_f1_values:
             avg_url_f1 = sum(url_f1_values) / len(url_f1_values)
             url_f1_scores.append(avg_url_f1)
@@ -156,38 +150,17 @@ async def main():
 
     args = parser.parse_args()
 
-    # Auto-detect paths if not provided
+    # Auto-detect paths if not provided using HEALConfig
+    from heal.core.config import HEALConfig
+
     if not args.okp_mcp_root:
-        candidates = [
-            Path("../okp-mcp"),
-            Path("../../okp-mcp"),
-            Path("/home/emackey/Work/okp-mcp"),
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                args.okp_mcp_root = candidate.resolve()
-                break
+        args.okp_mcp_root = HEALConfig.get_okp_mcp_root()
 
     if not args.eval_root:
-        candidates = [
-            Path("../lightspeed-evaluation"),
-            Path("../../lightspeed-evaluation"),
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                args.eval_root = candidate.resolve()
-                break
+        args.eval_root = HEALConfig.get_lightspeed_eval_root()
 
     if not args.lscore_deploy_root:
-        candidates = [
-            Path("../lscore-deploy"),
-            Path("../../lscore-deploy"),
-            Path("/home/emackey/Work/lscore-deploy"),
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                args.lscore_deploy_root = candidate.resolve()
-                break
+        args.lscore_deploy_root = HEALConfig.get_lscore_deploy_root()
 
     # Validate paths
     if not args.baseline_fixture.exists():
@@ -198,27 +171,27 @@ async def main():
         print("❌ okp-mcp root not found", file=sys.stderr)
         sys.exit(1)
 
-    print("="*80)
+    print("=" * 80)
     print("QUICK FIX EVALUATION")
-    print("="*80)
+    print("=" * 80)
     print(f"Pattern: {args.pattern_id}")
     print(f"Runs: {args.runs}")
     print(f"Baseline: {args.baseline_fixture}")
     print(f"OKP-MCP: {args.okp_mcp_root}")
-    print("="*80)
+    print("=" * 80)
 
     # Step 1: Load baseline
     print("\n📊 Step 1: Load baseline metrics from fixture")
     baseline = await load_baseline_metrics(args.baseline_fixture)
 
-    print("\n" + "-"*80)
+    print("\n" + "-" * 80)
     print("BASELINE METRICS")
-    print("-"*80)
+    print("-" * 80)
     if "answer_correctness" in baseline:
         print(f"  Answer Correctness: {baseline['answer_correctness']:.3f}")
     if "url_f1" in baseline:
         print(f"  URL F1: {baseline['url_f1']:.3f}")
-    print("-"*80)
+    print("-" * 80)
 
     # Step 2: Run new evaluation
     print("\n📊 Step 2: Run evaluation with modified okp-mcp")
@@ -230,19 +203,19 @@ async def main():
         lscore_deploy_root=args.lscore_deploy_root,
     )
 
-    print("\n" + "-"*80)
+    print("\n" + "-" * 80)
     print("NEW METRICS")
-    print("-"*80)
+    print("-" * 80)
     if "answer_correctness" in new_metrics:
         print(f"  Answer Correctness: {new_metrics['answer_correctness']:.3f}")
     if "url_f1" in new_metrics:
         print(f"  URL F1: {new_metrics['url_f1']:.3f}")
-    print("-"*80)
+    print("-" * 80)
 
     # Step 3: Compare
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("COMPARISON")
-    print("="*80)
+    print("=" * 80)
 
     if "answer_correctness" in baseline and "answer_correctness" in new_metrics:
         delta_answer = new_metrics["answer_correctness"] - baseline["answer_correctness"]
@@ -272,7 +245,7 @@ async def main():
         else:
             print(f"  ➖ NO SIGNIFICANT CHANGE ({delta_f1:+.3f})")
 
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print()
 
 

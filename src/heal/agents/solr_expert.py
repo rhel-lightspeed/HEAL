@@ -68,7 +68,7 @@ class SolrExpertAgent:
         # Initialize search intelligence if not provided
         if self.search_intelligence_mgr is None:
             try:
-                from .search_intelligence import (
+                from heal.core.search_intelligence import (
                     SearchIntelligenceManager,
                 )
 
@@ -267,7 +267,7 @@ class SolrExpertAgent:
             found_docs: Documents that were retrieved
         """
         try:
-            from .search_intelligence import SearchResult
+            from heal.core.search_intelligence import SearchResult
 
             # Convert context to topic (e.g., "Need to verify RHEL 6 EOL" → "RHEL_6_EOL")
             topic = self._context_to_topic(verification_query.context)

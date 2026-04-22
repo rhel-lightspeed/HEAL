@@ -20,6 +20,7 @@ try:
         OkpMcpCodeAnalysis,
         SynthesizedSuggestion,
     )
+
     MULTI_AGENT_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
     MULTI_AGENT_AVAILABLE = False
@@ -60,6 +61,7 @@ def build_query(query):
 @pytest.fixture
 def mock_claude_response():
     """Create mock Claude API response."""
+
     def _create_response(text):
         class MockBlock:
             def __init__(self, text):
@@ -110,18 +112,20 @@ class TestSolrMultiAgentInitialization:
         """Test successful initialization."""
         system = SolrMultiAgentSystem(
             okp_mcp_root=mock_okp_mcp_root,
-            model="claude-sonnet-4-6",
+            use_tiered_routing=True,
         )
 
         assert system.okp_mcp_root == mock_okp_mcp_root
-        assert system.model == "claude-sonnet-4-6"
+        assert system.use_tiered_routing == True
+        assert system.model_tiers.medium == "claude-sonnet-4-6"
 
     def test_initialization_missing_okp_mcp(self, tmp_path):
-        """Test initialization fails with missing okp-mcp directory."""
+        """Test initialization with non-existent directory (no longer validated at init)."""
         nonexistent = tmp_path / "nonexistent"
 
-        with pytest.raises(ValueError, match="okp-mcp root not found"):
-            SolrMultiAgentSystem(okp_mcp_root=nonexistent)
+        # Directory existence is no longer checked at init (deferred to actual usage)
+        system = SolrMultiAgentSystem(okp_mcp_root=nonexistent)
+        assert system.okp_mcp_root == nonexistent
 
     def test_initialization_requires_claude_sdk(self, mock_okp_mcp_root, monkeypatch):
         """Test initialization fails gracefully without claude-agent-sdk."""
@@ -134,7 +138,9 @@ class TestSolrTheoryExpert:
     """Test Solr Expert agent (theory/best practices)."""
 
     @pytest.mark.asyncio
-    async def test_solr_expert_analysis(self, mock_okp_mcp_root, pattern_ticket_data, mock_claude_response, monkeypatch):
+    async def test_solr_expert_analysis(
+        self, mock_okp_mcp_root, pattern_ticket_data, mock_claude_response, monkeypatch
+    ):
         """Test Solr Expert provides theory-based advice for pattern."""
         system = SolrMultiAgentSystem(
             okp_mcp_root=mock_okp_mcp_root,
@@ -168,17 +174,23 @@ class TestSolrTheoryExpert:
         advice = await system._get_solr_theory_advice(
             pattern_id="BOOTLOADER_GRUB_ISSUES",
             failing_tickets=pattern_ticket_data,
+            model=system.model_tiers.medium,
         )
 
         # Assertions
         assert isinstance(advice, SolrTheoryAdvice)
-        assert "bootloader" in advice.problem_analysis.lower() or "stopword" in advice.problem_analysis.lower()
+        assert (
+            "bootloader" in advice.problem_analysis.lower()
+            or "stopword" in advice.problem_analysis.lower()
+        )
         assert advice.ideal_config["mm"] == "2<-1 5<60%"
         assert "title" in advice.ideal_config["qf"]
         assert len(advice.relevant_docs) > 0
 
     @pytest.mark.asyncio
-    async def test_solr_expert_handles_metrics(self, mock_okp_mcp_root, mock_claude_response, monkeypatch):
+    async def test_solr_expert_handles_metrics(
+        self, mock_okp_mcp_root, mock_claude_response, monkeypatch
+    ):
         """Test Solr Expert considers evaluation metrics."""
         system = SolrMultiAgentSystem(okp_mcp_root=mock_okp_mcp_root)
 
@@ -213,6 +225,7 @@ class TestSolrTheoryExpert:
         advice = await system._get_solr_theory_advice(
             pattern_id="TEST_PATTERN",
             failing_tickets=poor_metrics_tickets,
+            model=system.model_tiers.medium,
         )
 
         assert "F1=0.0" in advice.problem_analysis or "failure" in advice.problem_analysis.lower()
@@ -222,7 +235,9 @@ class TestOkpMcpCodeExpert:
     """Test OKP-MCP Code Expert agent (implementation analysis)."""
 
     @pytest.mark.asyncio
-    async def test_code_expert_reads_actual_code(self, mock_okp_mcp_root, mock_claude_response, monkeypatch):
+    async def test_code_expert_reads_actual_code(
+        self, mock_okp_mcp_root, mock_claude_response, monkeypatch
+    ):
         """Test Code Expert reads and analyzes actual okp-mcp code."""
         system = SolrMultiAgentSystem(okp_mcp_root=mock_okp_mcp_root)
 
@@ -258,6 +273,7 @@ class TestOkpMcpCodeExpert:
         analysis = await system._get_okp_mcp_code_analysis(
             pattern_id="BOOTLOADER_GRUB_ISSUES",
             solr_advice=solr_advice,
+            model=system.model_tiers.medium,
         )
 
         # Assertions - Code Expert found the bug
@@ -267,7 +283,9 @@ class TestOkpMcpCodeExpert:
         assert len(analysis.constraints) > 0
 
     @pytest.mark.asyncio
-    async def test_code_expert_identifies_constraints(self, mock_okp_mcp_root, mock_claude_response, monkeypatch):
+    async def test_code_expert_identifies_constraints(
+        self, mock_okp_mcp_root, mock_claude_response, monkeypatch
+    ):
         """Test Code Expert identifies implementation constraints."""
         system = SolrMultiAgentSystem(okp_mcp_root=mock_okp_mcp_root)
 
@@ -299,7 +317,9 @@ class TestOkpMcpCodeExpert:
             relevant_docs=[],
         )
 
-        analysis = await system._get_okp_mcp_code_analysis("RHEL_PATTERN", solr_advice)
+        analysis = await system._get_okp_mcp_code_analysis(
+            "RHEL_PATTERN", solr_advice, model=system.model_tiers.medium
+        )
 
         assert len(analysis.constraints) >= 2
         assert any("global" in c.lower() for c in analysis.constraints)
@@ -309,7 +329,9 @@ class TestSynthesizer:
     """Test Synthesizer agent (combines theory + code analysis)."""
 
     @pytest.mark.asyncio
-    async def test_synthesizer_combines_inputs(self, mock_okp_mcp_root, pattern_ticket_data, mock_claude_response, monkeypatch):
+    async def test_synthesizer_combines_inputs(
+        self, mock_okp_mcp_root, pattern_ticket_data, mock_claude_response, monkeypatch
+    ):
         """Test Synthesizer combines Solr theory + code analysis for pattern."""
         system = SolrMultiAgentSystem(okp_mcp_root=mock_okp_mcp_root)
 
@@ -351,6 +373,7 @@ class TestSynthesizer:
         suggestion = await system._synthesize_suggestion(
             pattern_id="BOOTLOADER_GRUB_ISSUES",
             failing_tickets=pattern_ticket_data,
+            model=system.model_tiers.medium,
             solr_advice=solr_advice,
             code_analysis=code_analysis,
         )
@@ -363,7 +386,9 @@ class TestSynthesizer:
         assert "params['ps']" in suggestion.old_code or "ps" in suggestion.old_code
 
     @pytest.mark.asyncio
-    async def test_synthesizer_assesses_confidence(self, mock_okp_mcp_root, mock_claude_response, monkeypatch):
+    async def test_synthesizer_assesses_confidence(
+        self, mock_okp_mcp_root, mock_claude_response, monkeypatch
+    ):
         """Test Synthesizer provides confidence score."""
         system = SolrMultiAgentSystem(okp_mcp_root=mock_okp_mcp_root)
 
@@ -392,7 +417,13 @@ class TestSynthesizer:
         solr_advice = SolrTheoryAdvice("", {}, "", [])
         code_analysis = OkpMcpCodeAnalysis("", [], [], {}, [])
 
-        suggestion = await system._synthesize_suggestion("TEST_PATTERN", test_tickets, solr_advice, code_analysis)
+        suggestion = await system._synthesize_suggestion(
+            "TEST_PATTERN",
+            test_tickets,
+            solr_advice,
+            code_analysis,
+            model=system.model_tiers.medium,
+        )
 
         assert suggestion.confidence == 0.92
         assert 0.0 <= suggestion.confidence <= 1.0
@@ -402,7 +433,9 @@ class TestMultiAgentIntegration:
     """Test full multi-agent flow (all 3 agents together)."""
 
     @pytest.mark.asyncio
-    async def test_full_optimization_flow(self, mock_okp_mcp_root, pattern_ticket_data, mock_claude_response, monkeypatch):
+    async def test_full_optimization_flow(
+        self, mock_okp_mcp_root, pattern_ticket_data, mock_claude_response, monkeypatch
+    ):
         """Test complete flow: Solr Expert → Code Expert → Synthesizer for pattern."""
         system = SolrMultiAgentSystem(okp_mcp_root=mock_okp_mcp_root)
 
@@ -498,6 +531,7 @@ class TestErrorHandling:
         result = await system._get_solr_theory_advice(
             pattern_id="TEST_PATTERN",
             failing_tickets=test_tickets,
+            model=system.model_tiers.medium,
         )
 
         # Verify fallback response
@@ -506,7 +540,9 @@ class TestErrorHandling:
         assert result.reasoning == "JSON parsing error - using fallback"
 
     @pytest.mark.asyncio
-    async def test_handles_missing_fields(self, mock_okp_mcp_root, mock_claude_response, monkeypatch):
+    async def test_handles_missing_fields(
+        self, mock_okp_mcp_root, mock_claude_response, monkeypatch
+    ):
         """Test handling of missing required fields in responses."""
         system = SolrMultiAgentSystem(okp_mcp_root=mock_okp_mcp_root)
 
@@ -532,6 +568,7 @@ class TestErrorHandling:
         result = await system._get_solr_theory_advice(
             pattern_id="TEST_PATTERN",
             failing_tickets=test_tickets,
+            model=system.model_tiers.medium,
         )
 
         # Verify it populated the provided field and used defaults for missing ones
@@ -545,7 +582,9 @@ class TestRealWorldScenarios:
     """Test with realistic scenarios."""
 
     @pytest.mark.asyncio
-    async def test_deprecation_query_scenario(self, mock_okp_mcp_root, mock_claude_response, monkeypatch):
+    async def test_deprecation_query_scenario(
+        self, mock_okp_mcp_root, mock_claude_response, monkeypatch
+    ):
         """Test optimization for deprecation queries."""
         system = SolrMultiAgentSystem(okp_mcp_root=mock_okp_mcp_root)
 
@@ -584,7 +623,7 @@ class TestRealWorldScenarios:
   "risks": []
 }
 ```
-"""
+""",
         }
 
         async def mock_query(prompt, **kwargs):
@@ -614,7 +653,9 @@ class TestRealWorldScenarios:
 
         # Synthesizer should recognize no change needed
         assert suggestion.confidence > 0.9
-        assert "already" in suggestion.reasoning.lower() or "optimal" in suggestion.reasoning.lower()
+        assert (
+            "already" in suggestion.reasoning.lower() or "optimal" in suggestion.reasoning.lower()
+        )
 
     @pytest.mark.asyncio
     async def test_stopword_heavy_query(self, mock_okp_mcp_root, mock_claude_response, monkeypatch):
@@ -652,6 +693,7 @@ class TestRealWorldScenarios:
         advice = await system._get_solr_theory_advice(
             pattern_id="STOPWORD_PATTERN",
             failing_tickets=stopword_tickets,
+            model=system.model_tiers.medium,
         )
 
         assert "stopword" in advice.problem_analysis.lower()

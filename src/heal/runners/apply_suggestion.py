@@ -97,9 +97,7 @@ def apply_suggestion(suggestion_path: Path, okp_mcp_root: Path) -> bool:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Apply multi-agent suggestion to okp-mcp codebase"
-    )
+    parser = argparse.ArgumentParser(description="Apply multi-agent suggestion to okp-mcp codebase")
     parser.add_argument(
         "--suggestion",
         type=Path,

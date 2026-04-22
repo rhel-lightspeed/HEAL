@@ -9,10 +9,16 @@ import asyncio
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage
 from pydantic import BaseModel, Field
+
+from heal.agents.base_agent import (
+    BaseAgent,
+    ModelTierConfig,
+    TicketMetrics,
+)
 
 
 class SolrConfigSuggestion(BaseModel):
@@ -587,12 +593,12 @@ class MetricSummary:
         return "\n".join(lines)
 
 
-class OkpMcpLLMAdvisor:
+class OkpMcpLLMAdvisor(BaseAgent):
     """AI-powered advisor for automatically diagnosing and fixing okp-mcp RAG issues.
 
     This class uses Claude (via Claude Agent SDK) to analyze evaluation metrics and
     suggest targeted code changes to improve document retrieval and answer quality.
-    It implements tiered model routing to optimize cost vs. quality tradeoffs.
+    Inherits from BaseSolrOptimizer for tiered model routing.
 
     Core Capabilities:
         1. Diagnose Problems: Analyzes metrics to identify retrieval vs. answer issues
@@ -605,7 +611,7 @@ class OkpMcpLLMAdvisor:
         - Good Retrieval, Bad Answer: Right docs but LLM ignores them → Suggest prompt changes
         - Complex Multi-faceted Issues: Automatically escalates to more capable model
 
-    Tiered Model Routing:
+    Tiered Model Routing (from BaseSolrOptimizer):
         - Simple (Haiku): Fast problem classification (SIMPLE/MEDIUM/COMPLEX)
         - Medium (Sonnet): Default for most suggestions, good balance of cost/quality
         - Complex (Opus): Escalation for ambiguous or multi-faceted problems
@@ -621,9 +627,12 @@ class OkpMcpLLMAdvisor:
     Usage Example - Solr Config Optimization:
         # Initialize advisor
         advisor = OkpMcpLLMAdvisor(
-            model="claude-sonnet-4-6",
             okp_mcp_root=Path("~/Work/okp-mcp"),
-            use_tiered_models=True
+            model_tiers=ModelTierConfig(
+                simple="claude-haiku-4-5",
+                medium="claude-sonnet-4-6",
+                complex="claude-opus-4-7",
+            ),
         )
 
         # Create metrics summary from evaluation
@@ -668,56 +677,50 @@ class OkpMcpLLMAdvisor:
         5. Repeat until fixed or max iterations reached
 
     Attributes:
-        model: Default model for medium complexity (usually claude-sonnet-4-6)
         okp_mcp_root: Path to okp-mcp repository for code editing
-        use_tiered_models: Whether to enable smart model routing
-        simple_model: Model for fast classification (claude-haiku-4-5-20251001)
-        medium_model: Model for most work (same as model param)
-        complex_model: Model for hard problems (claude-opus-4-6)
+        model_tiers: ModelTierConfig with simple/medium/complex model names
+        use_tiered_routing: Whether to enable smart model routing
 
     Methods:
         suggest_boost_query_changes: Analyze retrieval issues, suggest Solr config fixes
         suggest_prompt_changes: Analyze answer issues, suggest system prompt fixes
-        classify_problem_complexity: Classify as SIMPLE/MEDIUM/COMPLEX for routing
+        classify_problem_complexity: Classify as SIMPLE/MEDIUM/COMPLEX for routing (inherited)
     """
 
     def __init__(
         self,
-        model: str = "claude-sonnet-4-6",
         okp_mcp_root: Optional[Path] = None,
-        # Tiered model routing
-        use_tiered_models: bool = True,
-        simple_model: Optional[str] = None,
-        complex_model: Optional[str] = None,
+        model_tiers: Optional[ModelTierConfig] = None,
+        use_tiered_routing: bool = True,
+        default_model: Optional[str] = None,
     ):
         """Initialize LLM advisor with Claude Agent SDK.
 
         Args:
-            model: Default model for medium complexity tasks (default: claude-sonnet-4-6)
             okp_mcp_root: Path to okp-mcp repository for code context (default: ~/Work/okp-mcp)
-            use_tiered_models: Enable smart model routing (default: True)
-            simple_model: Model for simple tasks (default: claude-haiku-4-5-20251001)
-            complex_model: Model for complex tasks (default: claude-opus-4-6)
+            model_tiers: Model configuration for each tier (simple/medium/complex)
+            use_tiered_routing: Enable smart model routing (default: True)
+            default_model: Override model for all tiers (disables routing)
         """
-        self.model = model
-        self.okp_mcp_root = okp_mcp_root or (Path.home() / "Work/okp-mcp")
-        self.use_tiered_models = use_tiered_models
+        # Initialize base class with model tier management
+        super().__init__(
+            model_tiers=model_tiers,
+            use_tiered_routing=use_tiered_routing,
+            default_model=default_model,
+        )
 
-        # Set up tiered models
-        if use_tiered_models:
-            self.simple_model = simple_model or "claude-haiku-4-5-20251001"
-            self.medium_model = model
-            self.complex_model = complex_model or "claude-opus-4-6"
-        else:
-            self.simple_model = model
-            self.medium_model = model
-            self.complex_model = model
+        # Store okp-mcp root for Solr config analysis
+        from heal.core.config import HEALConfig
+
+        self.okp_mcp_root = okp_mcp_root or HEALConfig.get_okp_mcp_root()
+
+        if not self.okp_mcp_root:
+            raise ValueError(
+                "OKP-MCP repository not found. Set OKP_MCP_ROOT environment variable "
+                "or place okp-mcp repository adjacent to HEAL (../okp-mcp)."
+            )
 
         print("✅ Initialized LLM Advisor with Claude Agent SDK")
-        if use_tiered_models:
-            print(f"   Simple model: {self.simple_model}")
-            print(f"   Medium model: {self.medium_model}")
-            print(f"   Complex model: {self.complex_model}")
 
     async def _call_with_structured_output(
         self, model: str, system_prompt: str, user_prompt: str, output_schema: dict
@@ -778,7 +781,9 @@ IMPORTANT: Your response MUST end with the JSON block above. Do not skip this st
 
         try:
             # Log debug output to file
-            log_file = Path("/tmp/claude_sdk_debug.log")
+            from heal.core.config import HEALConfig
+
+            log_file = HEALConfig.get_log_dir() / "claude_sdk_debug.log"
             print(f"🔍 DEBUG: Opening log file: {log_file}")
             print(f"🔍 DEBUG: Claude will edit files in: {self.okp_mcp_root}")
             print(f"🔍 DEBUG: Working directory exists: {Path(self.okp_mcp_root).exists()}")
@@ -870,95 +875,6 @@ IMPORTANT: Your response MUST end with the JSON block above. Do not skip this st
                     log.write(f"\n❌ JSON parse error: {e}\n")
                     log.write(f"Attempted to parse: {json_str[:500]}\n")
                     raise
-        finally:
-            # Restore original GOOGLE_APPLICATION_CREDENTIALS
-            if saved_google_creds:
-                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = saved_google_creds
-
-    async def classify_problem_complexity(self, metrics: MetricSummary) -> str:
-        """Quickly classify problem complexity using cheap model.
-
-        Args:
-            metrics: Evaluation metrics summary
-
-        Returns:
-            "SIMPLE", "MEDIUM", or "COMPLEX"
-        """
-        if not self.use_tiered_models:
-            return "MEDIUM"
-
-        system_prompt = """You are a quick diagnostic classifier.
-Analyze metrics and categorize the problem as: SIMPLE, MEDIUM, or COMPLEX.
-
-SIMPLE: Clear pattern, obvious fix
-- URL F1 = 0.0 and only 1-2 docs retrieved → clearly wrong doc type
-- RAG not used at all → configuration issue
-
-MEDIUM: Needs analysis but straightforward
-- URL F1 between 0.3-0.7 → some docs correct, some wrong
-- Keywords missing but retrieval good → prompt issue
-
-COMPLEX: Ambiguous or multi-faceted
-- All metrics borderline
-- Conflicting signals
-- Multiple problems at once
-
-Respond with ONLY one word: SIMPLE, MEDIUM, or COMPLEX."""
-
-        user_prompt = f"""Classify this problem:
-
-{metrics.to_prompt_context()}
-
-Is this SIMPLE, MEDIUM, or COMPLEX?"""
-
-        complexity = "MEDIUM"
-
-        from pathlib import Path
-        import tempfile
-
-        # CRITICAL: Temporarily unset GOOGLE_APPLICATION_CREDENTIALS
-        # The .env file sets this for Gemini, but it conflicts with Claude CLI's ADC
-        import os
-
-        saved_google_creds = os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
-
-        try:
-            # Log debug output to file
-            log_file = Path("/tmp/claude_sdk_debug.log")
-            with open(log_file, "a") as log:
-                log.write(f"\n{'='*80}\n")
-                log.write(f"classify_problem_complexity() - {self.simple_model}\n")
-                log.write(f"CWD: {os.getcwd()}\n")
-                log.write(
-                    f"ANTHROPIC_VERTEX_PROJECT_ID: {os.getenv('ANTHROPIC_VERTEX_PROJECT_ID')}\n"
-                )
-                log.write(
-                    f"GOOGLE_APPLICATION_CREDENTIALS: {os.getenv('GOOGLE_APPLICATION_CREDENTIALS')} (should be None)\n"
-                )
-                log.write(f"{'='*80}\n")
-
-                # Use temp directory to avoid CLAUDE.md interference
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    async for message in query(
-                        prompt=f"{system_prompt}\n\n{user_prompt}",
-                        options=ClaudeAgentOptions(
-                            model=self.simple_model,
-                            allowed_tools=[],
-                            permission_mode="auto",
-                            max_turns=5,
-                            debug_stderr=log,  # Write to log file
-                            cwd=tmpdir,
-                        ),
-                    ):
-                        if isinstance(message, AssistantMessage):
-                            for block in message.content:
-                                if hasattr(block, "text"):
-                                    text = block.text.strip().upper()
-                                    if text in ["SIMPLE", "MEDIUM", "COMPLEX"]:
-                                        complexity = text
-                                        break
-
-            return complexity
         finally:
             # Restore original GOOGLE_APPLICATION_CREDENTIALS
             if saved_google_creds:
@@ -1093,17 +1009,31 @@ but we want to catch cases where the judge is clearly wrong or the evaluation is
             Structured suggestion for Solr config changes
         """
         print(f"🔍 DEBUG: suggest_solr_config_changes called for ticket {metrics.ticket_id}")
-        print(f"🔍 DEBUG: auto_escalate={auto_escalate}, medium_model={self.medium_model}")
+        print(f"🔍 DEBUG: auto_escalate={auto_escalate}, medium_model={self.model_tiers.medium}")
 
         # Classify complexity if tiered models enabled
-        model_to_use = self.medium_model
-        if self.use_tiered_models and auto_escalate:
-            complexity = await self.classify_problem_complexity(metrics)
+        model_to_use = self.model_tiers.medium
+        if self.use_tiered_routing and auto_escalate:
+            # Convert MetricSummary to base class format for classification
+            # TicketMetrics already imported from base_agent at top
+
+            ticket_metrics = TicketMetrics(
+                ticket_id=metrics.ticket_id,
+                query=metrics.query,
+                url_f1=metrics.url_f1 or 0.0,
+                mrr=metrics.mrr or 0.0,
+                answer_correctness=metrics.answer_correctness,
+                faithfulness=metrics.faithfulness,
+            )
+
+            complexity = await self.classify_complexity(
+                tickets=[ticket_metrics],
+                solr_explain=str(metrics.solr_explain) if metrics.solr_explain else None,
+            )
             print(f"  Problem complexity: {complexity}")
 
-            if complexity == "COMPLEX":
-                print(f"  Escalating to complex model: {self.complex_model}")
-                model_to_use = self.complex_model
+            model_to_use = self.get_model_for_complexity(complexity)
+            print(f"  Using model: {model_to_use}")
 
         system_prompt = """You are an expert in Solr/Lucene search optimization with deep knowledge of edismax query parser.
 
@@ -1312,12 +1242,15 @@ Be concrete: which parameter, which line, which value, why based on explain outp
         except Exception as e:
             error_msg = str(e)
             # Check if this is a Claude Agent SDK failure
-            if "Command failed with exit code 1" in error_msg and model_to_use != self.medium_model:
+            if (
+                "Command failed with exit code 1" in error_msg
+                and model_to_use != self.model_tiers.medium
+            ):
                 print(f"⚠️  {model_to_use} failed with: {error_msg}")
-                print(f"  Falling back to {self.medium_model}...")
+                print(f"  Falling back to {self.model_tiers.medium}...")
                 # Retry with medium model
                 result = await self._call_with_structured_output(
-                    model=self.medium_model,
+                    model=self.model_tiers.medium,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     output_schema=SolrConfigSuggestion.model_json_schema(),
@@ -1348,14 +1281,28 @@ Be concrete: which parameter, which line, which value, why based on explain outp
             Structured suggestion for prompt changes
         """
         # Classify complexity if tiered models enabled
-        model_to_use = self.medium_model
-        if self.use_tiered_models and auto_escalate:
-            complexity = await self.classify_problem_complexity(metrics)
+        model_to_use = self.model_tiers.medium
+        if self.use_tiered_routing and auto_escalate:
+            # Convert MetricSummary to base class format for classification
+            # TicketMetrics already imported from base_agent at top
+
+            ticket_metrics = TicketMetrics(
+                ticket_id=metrics.ticket_id,
+                query=metrics.query,
+                url_f1=metrics.url_f1 or 0.0,
+                mrr=metrics.mrr or 0.0,
+                answer_correctness=metrics.answer_correctness,
+                faithfulness=metrics.faithfulness,
+            )
+
+            complexity = await self.classify_complexity(
+                tickets=[ticket_metrics],
+                solr_explain=str(metrics.solr_explain) if metrics.solr_explain else None,
+            )
             print(f"  Problem complexity: {complexity}")
 
-            if complexity == "COMPLEX":
-                print(f"  Escalating to complex model: {self.complex_model}")
-                model_to_use = self.complex_model
+            model_to_use = self.get_model_for_complexity(complexity)
+            print(f"  Using model: {model_to_use}")
 
         system_prompt = """You are an expert in LLM prompt engineering for RAG systems.
 
@@ -1402,12 +1349,15 @@ STEP 2: Provide a JSON summary (MANDATORY - your response MUST end with this)"""
         except Exception as e:
             error_msg = str(e)
             # Check if this is a Claude Agent SDK failure
-            if "Command failed with exit code 1" in error_msg and model_to_use != self.medium_model:
+            if (
+                "Command failed with exit code 1" in error_msg
+                and model_to_use != self.model_tiers.medium
+            ):
                 print(f"⚠️  {model_to_use} failed with: {error_msg}")
-                print(f"  Falling back to {self.medium_model}...")
+                print(f"  Falling back to {self.model_tiers.medium}...")
                 # Retry with medium model
                 result = await self._call_with_structured_output(
-                    model=self.medium_model,
+                    model=self.model_tiers.medium,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     output_schema=PromptSuggestion.model_json_schema(),
@@ -1441,6 +1391,30 @@ STEP 2: Provide a JSON summary (MANDATORY - your response MUST end with this)"""
 
         return "Metrics look good overall"
 
+    async def suggest_improvements(
+        self,
+        tickets: List[MetricSummary],
+        iteration_context: Optional[str] = None,
+        **kwargs,
+    ) -> SolrConfigSuggestion:
+        """Generate Solr optimization suggestions (implements BaseSolrOptimizer interface).
+
+        Args:
+            tickets: List of metric summaries to analyze (typically single ticket)
+            iteration_context: Optional context from previous iterations
+            **kwargs: Additional arguments
+
+        Returns:
+            Solr config suggestion for improving the ticket(s)
+        """
+        # LLM advisor typically works on single tickets
+        if not tickets:
+            raise ValueError("No tickets provided for analysis")
+
+        # For now, analyze the first ticket
+        # Future: Could aggregate metrics across multiple tickets
+        return await self.suggest_solr_config_changes(tickets[0])
+
 
 if __name__ == "__main__":
     import sys
@@ -1455,9 +1429,7 @@ if __name__ == "__main__":
 
     try:
         advisor = OkpMcpLLMAdvisor(
-            model="claude-sonnet-4-6",
-            use_tiered_models=True,
-            simple_model="claude-haiku-4-5-20251001",
+            use_tiered_routing=True,  # Uses default model tiers
         )
     except Exception as e:
         print(f"❌ Error initializing advisor: {e}")

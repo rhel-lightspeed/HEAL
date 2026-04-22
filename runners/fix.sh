@@ -30,7 +30,14 @@ NC='\033[0m' # No Color
 # Default settings
 MAX_ITERATIONS=10
 STABILITY_RUNS=3
+VALIDATION_CYCLES=3  # Outer loop cycles (answer validations) - default 3 for correlation data
 MODE="full"  # full = test all tickets, single = test one ticket per pattern
+
+# Integration flags (both default to OFF for safety)
+CREATE_PR=false
+NO_JIRA_UPDATES=true  # Jira updates DISABLED by default - use --enable-jira to enable
+DRY_RUN_INTEGRATIONS=false
+YOLO_MODE=false  # Interactive review ENABLED by default - use --yolo to disable
 
 # Parse arguments
 PATTERN_ID=""
@@ -50,6 +57,10 @@ while [[ $# -gt 0 ]]; do
             STABILITY_RUNS="$2"
             shift 2
             ;;
+        --validation-cycles)
+            VALIDATION_CYCLES="$2"
+            shift 2
+            ;;
         --mode)
             MODE="$2"
             if [[ "$MODE" != "single" && "$MODE" != "full" ]]; then
@@ -58,6 +69,26 @@ while [[ $# -gt 0 ]]; do
             fi
             shift 2
             ;;
+        --create-pr)
+            CREATE_PR=true
+            shift
+            ;;
+        --enable-jira)
+            NO_JIRA_UPDATES=false  # Enable Jira updates
+            shift
+            ;;
+        --no-jira-updates)
+            NO_JIRA_UPDATES=true  # Kept for backwards compatibility
+            shift
+            ;;
+        --dry-run-integrations)
+            DRY_RUN_INTEGRATIONS=true
+            shift
+            ;;
+        --yolo)
+            YOLO_MODE=true
+            shift
+            ;;
         --help)
             echo "Usage: $0 [PATTERN_ID] [OPTIONS]"
             echo ""
@@ -65,11 +96,21 @@ while [[ $# -gt 0 ]]; do
             echo "  PATTERN_ID            Run fix loop on specific pattern (default: all patterns)"
             echo ""
             echo "Options:"
-            echo "  --quick               Quick test mode (2 iterations, single ticket)"
-            echo "  --max-iterations N    Max fix iterations (default: 10)"
-            echo "  --stability-runs N    Evaluations to confirm stability (default: 3)"
-            echo "  --mode single|full    Test mode - single ticket or full pattern (default: full)"
-            echo "  --help                Show this help"
+            echo "  --quick                    Quick test mode (2 iterations, single ticket)"
+            echo "  --max-iterations N         Max Solr iterations per cycle (default: 10)"
+            echo "  --validation-cycles N      Outer loop cycles with full answer validation (default: 3)"
+            echo "  --stability-runs N         Evaluations to confirm stability (default: 3)"
+            echo "  --mode single|full         Test mode - single ticket or full pattern (default: full)"
+            echo ""
+            echo "Integration Options (both DEFAULT: OFF):"
+            echo "  --enable-jira              Enable Jira comment updates (default: disabled)"
+            echo "  --create-pr                Create GitHub PR after successful fix (requires gh CLI)"
+            echo "  --dry-run-integrations     Preview integration actions without executing"
+            echo ""
+            echo "Review Options:"
+            echo "  --yolo                     YOLO mode: auto-approve changes (default: interactive review)"
+            echo ""
+            echo "  --help                     Show this help"
             echo ""
             echo "Examples:"
             echo "  $0                                    # Run all patterns (full mode)"
@@ -121,7 +162,8 @@ if [ -n "$PATTERN_ID" ]; then
     echo -e "${BLUE}Mode:${NC} Single pattern"
     echo -e "${BLUE}Pattern:${NC} $PATTERN_ID"
     echo -e "${BLUE}Test mode:${NC} $MODE"
-    echo -e "${BLUE}Max iterations:${NC} $MAX_ITERATIONS"
+    echo -e "${BLUE}Max Solr iterations:${NC} $MAX_ITERATIONS (per cycle)"
+    echo -e "${BLUE}Validation cycles:${NC} $VALIDATION_CYCLES (outer loop with full answer eval)"
     echo -e "${BLUE}Stability runs:${NC} $STABILITY_RUNS"
     echo -e "${BLUE}Date:${NC} $(date '+%Y-%m-%d %H:%M:%S')"
     echo ""
@@ -143,13 +185,19 @@ if [ -n "$PATTERN_ID" ]; then
         "$PATTERN_ID" \
         --mode "$MODE" \
         --max-iterations "$MAX_ITERATIONS" \
-        --stability-runs "$STABILITY_RUNS"
+        --validation-cycles "$VALIDATION_CYCLES" \
+        --stability-runs "$STABILITY_RUNS" \
+        $([ "$CREATE_PR" = true ] && echo "--create-pr") \
+        $([ "$NO_JIRA_UPDATES" = true ] && echo "--no-jira-updates") \
+        $([ "$DRY_RUN_INTEGRATIONS" = true ] && echo "--dry-run-integrations") \
+        $([ "$YOLO_MODE" = true ] && echo "--yolo")
 
 else
     # Batch mode - all patterns
     echo -e "${BLUE}Mode:${NC} Batch (all patterns)"
     echo -e "${BLUE}Test mode:${NC} $MODE"
-    echo -e "${BLUE}Max iterations:${NC} $MAX_ITERATIONS"
+    echo -e "${BLUE}Max Solr iterations:${NC} $MAX_ITERATIONS (per cycle)"
+    echo -e "${BLUE}Validation cycles:${NC} $VALIDATION_CYCLES (outer loop with full answer eval)"
     echo -e "${BLUE}Stability runs:${NC} $STABILITY_RUNS"
     echo -e "${BLUE}Date:${NC} $(date '+%Y-%m-%d %H:%M:%S')"
     echo ""
@@ -160,6 +208,7 @@ else
     # Run batch script
     exec scripts/run_all_pattern_fixes.sh \
         --max-iterations "$MAX_ITERATIONS" \
+        --validation-cycles "$VALIDATION_CYCLES" \
         --stability-runs "$STABILITY_RUNS" \
         --mode "$MODE"
 fi

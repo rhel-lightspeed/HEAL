@@ -114,7 +114,7 @@ class TestSolrExpert:
 
         Tests direct HTTP connection to Solr and document retrieval.
         """
-        from heal.core.solr_expert import SolrExpertAgent
+        from heal.agents.solr_expert import SolrExpertAgent
 
         agent = SolrExpertAgent()
 
@@ -136,7 +136,7 @@ class TestSolrExpert:
 
         Tests full verification workflow with real queries.
         """
-        from heal.core.solr_expert import (
+        from heal.agents.solr_expert import (
             SolrExpertAgent,
             VerificationQuery,
         )
@@ -166,7 +166,7 @@ class TestLinuxExpert:
 
         Tests ticket analysis and hypothesis generation using REAL agent.
         """
-        from heal.core.linux_expert import LinuxExpertAgent
+        from heal.agents.linux_expert import LinuxExpertAgent
 
         agent = LinuxExpertAgent()
 
@@ -189,8 +189,8 @@ class TestLinuxExpert:
 
         Tests answer synthesis from verification results using REAL agent.
         """
-        from heal.core.linux_expert import LinuxExpertAgent
-        from heal.core.solr_expert import VerificationResult
+        from heal.agents.linux_expert import LinuxExpertAgent
+        from heal.agents.solr_expert import VerificationResult
 
         agent = LinuxExpertAgent()
 
@@ -244,8 +244,8 @@ class TestIntegration:
 
         Tests end-to-end ticket extraction with verification using REAL agents.
         """
-        from heal.core.linux_expert import LinuxExpertAgent
-        from heal.core.solr_expert import SolrExpertAgent
+        from heal.agents.linux_expert import LinuxExpertAgent
+        from heal.agents.solr_expert import SolrExpertAgent
 
         ticket = {
             "key": "TEST-001",
@@ -260,9 +260,12 @@ class TestIntegration:
 
         result = await linux_expert.extract_with_verification(ticket, solr_expert)
 
-        assert result.ticket_key == "TEST-001"
-        assert result.query
-        assert result.expected_response
-        assert result.confidence in ["HIGH", "MEDIUM", "LOW"]
-        assert isinstance(result.sources, list)
-        assert isinstance(result.inferred, bool)
+        # extract_with_verification returns Conversation object
+        assert result.conversation_group_id == "TEST-001"
+        assert len(result.turns) > 0
+
+        # Check first turn has expected data
+        first_turn = result.turns[0]
+        assert first_turn.query
+        assert first_turn.expected_response
+        assert isinstance(first_turn.expected_urls, list)

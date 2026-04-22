@@ -34,10 +34,13 @@ import yaml
 
 from heal.agents.okp_mcp_agent import OkpMcpAgent, PatternEvaluationResult, TIER_MODELS
 from heal.core.ticket_evaluation import PatternEvaluation, TicketEvaluation
+from heal.core.fix_pattern_database import FixPatternDatabase
+from heal.core.token_tracker import TokenTracker
 
 # Optional multi-agent system (requires claude-agent-sdk)
 try:
     from heal.agents.solr_multi_agent import SolrMultiAgentSystem, TicketData
+
     MULTI_AGENT_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
     SolrMultiAgentSystem = None
@@ -110,6 +113,12 @@ class PatternFixAgent(OkpMcpAgent):
             lscore_deploy_root: Path to lscore-deploy repo
             **kwargs: Additional options (interactive, enable_llm_advisor, etc.)
         """
+        # Extract integration flags before passing to parent
+        self.create_pr: bool = kwargs.pop("create_pr", False)
+        self.no_jira_updates: bool = kwargs.pop("no_jira_updates", False)
+        self.dry_run_integrations: bool = kwargs.pop("dry_run_integrations", False)
+        self.include_judge_reasoning: bool = kwargs.pop("include_judge_reasoning", False)
+
         super().__init__(
             eval_root=eval_root,
             okp_mcp_root=okp_mcp_root,
@@ -131,9 +140,11 @@ class PatternFixAgent(OkpMcpAgent):
             try:
                 self.multi_agent = SolrMultiAgentSystem(
                     okp_mcp_root=okp_mcp_root,
-                    model="claude-sonnet-4-6",
+                    use_tiered_routing=True,  # Use defaults: haiku/sonnet/opus
+                    include_judge_reasoning=self.include_judge_reasoning,
                 )
-                print("✅ Multi-agent Solr optimization enabled (Solr Expert + Code Expert)")
+                judge_mode = "with" if self.include_judge_reasoning else "without"
+                print(f"✅ Multi-agent Solr optimization enabled ({judge_mode} judge reasoning)")
             except Exception as e:
                 print(f"⚠️  Multi-agent system failed to initialize: {e}")
                 print("   Falling back to single-agent mode")
@@ -142,6 +153,14 @@ class PatternFixAgent(OkpMcpAgent):
             print("⚠️  Multi-agent system not available (requires claude-agent-sdk)")
             print("   Using single-agent mode")
             self.multi_agent = None
+
+        # Initialize pattern database for tracking cumulative improvements
+        self.pattern_db = FixPatternDatabase()
+        print("✅ Pattern database initialized for incremental learning")
+
+        # Initialize token tracker for thesis validation
+        self.token_tracker = TokenTracker(pattern_id=pattern_id)
+        print("✅ Token tracker initialized for efficiency analysis")
 
         # Register cleanup handlers
         atexit.register(self.cleanup)
@@ -221,6 +240,14 @@ class PatternFixAgent(OkpMcpAgent):
             print("      3. If failing: Flag for SME review (needs new documentation)")
             print("      4. Skip retrieval optimization (no docs to optimize)")
             print("      5. Re-test in final validation (ensure no regression)\n")
+
+    def get_ticket_ids(self) -> List[str]:
+        """Get list of ticket IDs from pattern tickets.
+
+        Returns:
+            List of ticket IDs (e.g., ["RSPEED-2482", "RSPEED-2511"])
+        """
+        return [t["ticket_id"] for t in self.pattern_tickets]
 
     def _signal_handler(self, signum, frame):
         """Handle Ctrl+C and other signals gracefully."""
@@ -319,14 +346,20 @@ class PatternFixAgent(OkpMcpAgent):
         answer_threshold: float = 0.90,
         stability_runs: int = 5,
         mode: str = "single",
+        validation_cycles: int = 1,
     ) -> PatternFixResult:
         """Run complete fix loop with all phases.
 
+        Implements nested loop architecture for pattern mode:
+        - Outer loop: validation_cycles (full answer eval after each)
+        - Inner loop: max_iterations (fast Solr optimization)
+
         Args:
-            max_iterations: Max iterations for optimization phases
+            max_iterations: Max inner loop iterations (Solr optimizations per cycle)
             answer_threshold: Minimum answer_correctness to pass
             stability_runs: Number of runs for stability check
             mode: Testing mode - 'single' (one ticket) or 'full' (all tickets)
+            validation_cycles: Max outer loop cycles (answer validations)
 
         Returns:
             PatternFixResult with complete status
@@ -351,7 +384,8 @@ class PatternFixAgent(OkpMcpAgent):
         print(f"Tickets: {len(self.pattern_tickets)}")
         print(f"Branch: {self.branch_name}")
         print(f"Testing mode: {mode.upper()}")
-        print(f"Max iterations: {max_iterations}")
+        print(f"Max Solr iterations: {max_iterations}")
+        print(f"Validation cycles: {validation_cycles}")
         print(f"Answer threshold: {answer_threshold}")
         print(f"Stability runs: {stability_runs}")
         print(f"{'='*80}\n")
@@ -407,6 +441,9 @@ class PatternFixAgent(OkpMcpAgent):
             ans = baseline_result.final_metrics.get("answer_correctness", 0.0)
             faith = baseline_result.final_metrics.get("faithfulness", 0.0)
             print(f"   Answer: {ans:.2f}, Faithfulness: {faith:.2f}")
+
+            # Set baseline for token tracker
+            self.token_tracker.set_baseline(ans)
         else:
             print(f"   ❌ Baseline failed: {baseline_result.reason}")
         print(f"{'─'*80}\n")
@@ -456,6 +493,7 @@ class PatternFixAgent(OkpMcpAgent):
             baseline_result.final_metrics,
             max_iterations,
             baseline_result.baseline_result,
+            validation_cycles,
         )
         result.optimization = opt_result
 
@@ -550,6 +588,57 @@ class PatternFixAgent(OkpMcpAgent):
 
         # Print improvement summary
         self._print_improvement_summary(result)
+
+        # INTEGRATIONS: Update Jira and create PR (if successful and not disabled)
+        if result.success:
+            # Jira integration (default: ON, unless --no-jira-updates)
+            if not getattr(self, "no_jira_updates", False):
+                from heal.integrations.jira_integration import update_tickets_for_pattern
+
+                try:
+                    ticket_ids = self.get_ticket_ids()
+                    jira_result = update_tickets_for_pattern(
+                        pattern_result=result,
+                        pattern_id=self.pattern_id,
+                        ticket_ids=ticket_ids,
+                        dry_run=getattr(self, "dry_run_integrations", False),
+                    )
+
+                    if jira_result.success:
+                        print(f"✅ Updated {jira_result.tickets_updated} Jira tickets")
+                    else:
+                        print(f"⚠️  Jira updates failed: {jira_result.error}")
+                        if jira_result.fallback_file:
+                            print(f"   Comments saved to {jira_result.fallback_file}")
+                except Exception as e:
+                    print(f"⚠️  Jira integration error: {e}")
+                    print("   Pattern fix still succeeded - continue normally")
+
+            # PR creation (default: OFF, opt-in via --create-pr)
+            if getattr(self, "create_pr", False):
+                from heal.integrations.pr_creator import create_pattern_pr
+
+                try:
+                    pr_result = create_pattern_pr(
+                        pattern_result=result,
+                        branch_name=self.branch_name,
+                        okp_mcp_root=self.okp_mcp_root,
+                        dry_run=getattr(self, "dry_run_integrations", False),
+                    )
+
+                    if pr_result.success:
+                        print(f"✅ PR created: {pr_result.pr_url}")
+
+                        # Update Jira comments with PR link if Jira integration was enabled
+                        if not getattr(self, "no_jira_updates", False) and pr_result.pr_url:
+                            # TODO: Implement update_jira_with_pr_link() if needed
+                            pass
+                    else:
+                        print(f"⚠️  PR creation failed: {pr_result.error}")
+                        print("   Pattern fix still succeeded - create PR manually")
+                except Exception as e:
+                    print(f"⚠️  PR creation error: {e}")
+                    print("   Pattern fix still succeeded - create PR manually")
 
         return result
 
@@ -824,7 +913,9 @@ class PatternFixAgent(OkpMcpAgent):
 
                 # Check RAG status
                 rag_bypassed = self._is_rag_bypassed(result)
-                num_docs = result.num_docs_retrieved() if hasattr(result, "num_docs_retrieved") else 0
+                num_docs = (
+                    result.num_docs_retrieved() if hasattr(result, "num_docs_retrieved") else 0
+                )
 
                 print("\n📊 Baseline Metrics:")
                 print(f"   Runs:               {result.num_runs}")
@@ -873,6 +964,7 @@ class PatternFixAgent(OkpMcpAgent):
         baseline_metrics: Dict,
         max_iterations: int,
         baseline_result: Any = None,
+        validation_cycles: int = 1,
     ) -> PhaseResult:
         """Phase 2: Smart routing optimization.
 
@@ -881,11 +973,16 @@ class PatternFixAgent(OkpMcpAgent):
         - Bad retrieval → Retrieval optimization (Solr changes)
         - Good retrieval, bad answer → Prompt optimization (LLM not using docs)
 
+        For pattern-mode retrieval optimization, implements nested loops:
+        - Outer loop: validation_cycles (full answer eval after each)
+        - Inner loop: max_iterations (fast Solr optimization)
+
         Args:
             ticket_id: Ticket to optimize (None = all tickets in pattern)
             baseline_metrics: Baseline metrics from Phase 1
-            max_iterations: Max optimization iterations
+            max_iterations: Max inner loop iterations (Solr optimizations)
             baseline_result: Full diagnostic result for RAG bypass detection
+            validation_cycles: Max outer loop cycles (answer validations)
 
         Returns:
             PhaseResult with optimization outcome
@@ -938,7 +1035,9 @@ class PatternFixAgent(OkpMcpAgent):
             print("   Testing: Solr config changes (qf, pf, mm, highlighting, etc.)")
             print("   Mode: Retrieval-only (no response generation)")
             print("   Speed: ~15-20 sec/iteration")
-            return self.run_retrieval_optimization(ticket_id, baseline_metrics, max_iterations, baseline_result)
+            return self.run_retrieval_optimization(
+                ticket_id, baseline_metrics, max_iterations, baseline_result, validation_cycles
+            )
         elif is_answer:
             # Route B: Prompt optimization (system prompt changes)
             print("\n📍 Route B: PROMPT OPTIMIZATION")
@@ -948,10 +1047,17 @@ class PatternFixAgent(OkpMcpAgent):
             return self.run_prompt_optimization(ticket_id, baseline_metrics, max_iterations)
         else:
             print("\n⚠️  No clear problem identified - trying retrieval optimization")
-            return self.run_retrieval_optimization(ticket_id, baseline_metrics, max_iterations, baseline_result)
+            return self.run_retrieval_optimization(
+                ticket_id, baseline_metrics, max_iterations, baseline_result, validation_cycles
+            )
 
     def run_retrieval_optimization(
-        self, ticket_id: Optional[str], baseline_metrics: Dict, max_iterations: int, baseline_result: Any = None
+        self,
+        ticket_id: Optional[str],
+        baseline_metrics: Dict,
+        max_iterations: int,
+        baseline_result: Any = None,
+        validation_cycles: int = 1,
     ) -> PhaseResult:
         """Route A: Fast retrieval optimization (Solr config changes).
 
@@ -962,22 +1068,29 @@ class PatternFixAgent(OkpMcpAgent):
         4. Tests the change
         5. Commits if improved
 
+        For pattern mode, implements nested loop architecture:
+        - Outer loop: validation_cycles (each ends with full answer eval)
+        - Inner loop: max_iterations (fast Solr optimization)
+
         Args:
             ticket_id: Ticket to optimize
             baseline_metrics: Baseline metrics
-            max_iterations: Max iterations
+            max_iterations: Max inner loop (Solr) iterations per cycle
             baseline_result: Full baseline result (PatternEvaluationResult for pattern mode)
+            validation_cycles: Max outer loop (answer validation) cycles
 
         Returns:
             PhaseResult with optimization outcome
         """
-        print(f"   Max iterations: {max_iterations}")
+        print(f"   Max Solr iterations per cycle: {max_iterations}")
+        if validation_cycles > 1:
+            print(f"   Validation cycles: {validation_cycles}")
         print("   Early exit: F1 > 0 (any expected docs found)\n")
 
-        # Full-pattern mode: Pattern-wide optimization (NOT sequential per-ticket!)
+        # Full-pattern mode: Pattern-wide optimization with nested loops
         if not ticket_id:
             return self._run_pattern_wide_retrieval_optimization(
-                baseline_result, baseline_metrics, max_iterations
+                baseline_result, baseline_metrics, max_iterations, validation_cycles
             )
 
         # Load pattern YAML to get ticket details
@@ -1060,29 +1173,45 @@ class PatternFixAgent(OkpMcpAgent):
         baseline_result: PatternEvaluationResult,
         baseline_metrics: Dict,
         max_iterations: int,
+        validation_cycles: int = 1,
     ) -> PhaseResult:
-        """Pattern-wide retrieval optimization - ONE change tested on ALL tickets.
+        """Pattern-wide retrieval optimization with nested loop architecture.
 
-        This is the correct pattern-based approach:
+        NESTED LOOP ARCHITECTURE:
+        - OUTER LOOP (validation_cycles): Each cycle ends with full answer_correctness validation
+        - INNER LOOP (max_iterations): Fast Solr optimization with early exit when URL F1 improves
+
+        This implements incremental learning:
         1. Get baseline scores for ALL tickets
-        2. Get ONE Solr suggestion considering ALL failing tickets together
-        3. Apply change ONCE
-        4. Test ALL tickets
-        5. Show pattern-wide impact (which improved, which regressed)
-        6. Commit if net positive
-        7. Repeat for max_iterations
+        2. OUTER CYCLE loop (N times, default 1):
+           a. Get iteration context from pattern database (what worked before)
+           b. INNER LOOP: Fast Solr optimization (max_iterations)
+              - Get ONE Solr suggestion considering ALL failing tickets + prior context
+              - Apply change ONCE
+              - Test ALL tickets (fast URL F1 check)
+              - Commit if net positive (NEVER revert - cumulative improvement)
+              - Exit early if URL F1 improves significantly
+           c. After inner loop: FULL answer validation (~20 min)
+           d. Record iteration in pattern database
+           e. If answer_correctness >= threshold: SUCCESS, exit early
+           f. If improved: continue to next cycle
+           g. If stuck for N cycles: stop
+        3. Multi-agent sees ALL prior attempts through pattern database
 
         Args:
             baseline_result: Pattern baseline with per-ticket results
             baseline_metrics: Pattern-level baseline metrics
-            max_iterations: Max optimization iterations
+            max_iterations: Max inner loop (Solr) iterations per cycle
+            validation_cycles: Max outer loop (answer validation) cycles
 
         Returns:
             PhaseResult with pattern-wide optimization outcome
         """
-        print("🔄 Full-pattern mode: Pattern-wide retrieval optimization")
-        print(f"   Strategy: ONE change tested on ALL {len(baseline_result.per_ticket_results)} tickets")
-        print(f"   Max iterations: {max_iterations}\n")
+        print("🔄 Full-pattern mode: Pattern-wide retrieval optimization with incremental learning")
+        print(f"   Strategy: Nested loop with cumulative improvements")
+        print(f"   Outer loop (validation cycles): {validation_cycles}")
+        print(f"   Inner loop (Solr iterations per cycle): {max_iterations}")
+        print(f"   Tickets: {len(baseline_result.per_ticket_results)}\n")
 
         # Load pattern YAML to get all ticket details
         pattern_file = Path(f"config/patterns/{self.pattern_id}.yaml")
@@ -1127,21 +1256,61 @@ class PatternFixAgent(OkpMcpAgent):
             print(f"     • {tid}: F1={tres.url_f1:.2f}, MRR={tres.mrr or 0:.2f}")
         print()
 
-        # Pattern-wide optimization loop
-        print(f"{'='*80}")
-        print("PATTERN-WIDE RETRIEVAL OPTIMIZATION")
-        print(f"{'='*80}\n")
+        # Track overall progress across cycles
+        best_answer_correctness = baseline_result.pattern_answer_correctness or 0.0
+        total_commits_made = 0
+        cycles_without_improvement = 0
+        max_cycles_without_improvement = 2  # Stop if 2 cycles don't improve answer quality
 
-        best_pattern_f1 = baseline_result.pattern_url_f1
-        iteration_count = 0
-        commits_made = 0
-        iterations_without_improvement = 0
-        max_iterations_without_improvement = 3  # Exit if stuck for 3 iterations
+        # Track per-ticket baseline for regression detection
+        baseline_per_ticket = {}
+        best_per_ticket_result = None  # Track best result for final success check
+        if isinstance(baseline_result, PatternEvaluationResult):
+            for tid, tres in baseline_result.per_ticket_results.items():
+                baseline_per_ticket[tid] = {
+                    "answer": tres.answer_correctness or 0.0,
+                    "f1": tres.url_f1 or 0.0,
+                }
 
-        for iteration in range(1, max_iterations + 1):
-            print(f"\n--- Pattern Iteration {iteration}/{max_iterations} ---\n")
+        # OUTER VALIDATION CYCLE LOOP
+        for cycle in range(1, validation_cycles + 1):
+            print(f"\n{'='*80}")
+            print(f"🔄 VALIDATION CYCLE {cycle}/{validation_cycles}")
+            print(f"{'='*80}")
+            print(f"   Best answer_correctness so far: {best_answer_correctness:.2f}")
+            print(f"   Total commits made: {total_commits_made}")
+            print()
 
-            # Get suggestion using multi-agent system (if available)
+            # Set token tracker context for this cycle
+            self.token_tracker.set_iteration(iteration=iteration_count + 1, cycle=cycle)
+
+            # Get iteration context from pattern database (what worked before)
+            iteration_context = self.pattern_db.get_iteration_context(self.pattern_id)
+
+            if iteration_context:
+                print("📚 Loading iteration context from pattern database:")
+                print(
+                    iteration_context[:500] + "..."
+                    if len(iteration_context) > 500
+                    else iteration_context
+                )
+                print()
+
+            # INNER LOOP: Pattern-wide retrieval optimization
+            print(f"{'='*80}")
+            print(f"PATTERN-WIDE RETRIEVAL OPTIMIZATION - Cycle {cycle}")
+            print(f"{'='*80}\n")
+
+            best_pattern_f1 = baseline_result.pattern_url_f1
+            iteration_count = 0
+            commits_made = 0
+            iterations_without_improvement = 0
+            max_iterations_without_improvement = 3  # Exit if stuck for 3 iterations
+
+            for iteration in range(1, max_iterations + 1):
+                print(f"\n--- Pattern Iteration {iteration}/{max_iterations} ---\n")
+
+                # Get suggestion using multi-agent system (if available)
             if self.multi_agent:
                 print("🤖 Consulting multi-agent system for PATTERN analysis...\n")
                 print(f"   Analyzing ALL {len(failing_tickets)} failing tickets together\n")
@@ -1153,6 +1322,15 @@ class PatternFixAgent(OkpMcpAgent):
                         result = baseline_result.per_ticket_results[tid]
                         query_info = ticket_queries[tid]
 
+                        # Build judge reasoning dict if needed
+                        judge_reasoning = None
+                        if self.include_judge_reasoning:
+                            judge_reasoning = {
+                                "answer_correctness_reason": result.answer_correctness_reason,
+                                "faithfulness_reason": result.faithfulness_reason,
+                                "context_relevance_reason": result.context_relevance_reason,
+                            }
+
                         ticket_data = TicketData(
                             ticket_id=tid,
                             query=query_info["query"],
@@ -1162,14 +1340,19 @@ class PatternFixAgent(OkpMcpAgent):
                                 "url_f1": result.url_f1 or 0.0,
                                 "mrr": result.mrr or 0.0,
                             },
+                            # NEW: Diagnostic data for deeper analysis
+                            expected_response=result.expected_response,
+                            actual_llm_response=result.response,
+                            judge_reasoning=judge_reasoning,
                         )
                         failing_ticket_data.append(ticket_data)
 
-                    # Multi-agent approach: Pattern-level analysis
+                    # Multi-agent approach: Pattern-level analysis with iteration context
                     synthesized = self._run_async_in_thread(
                         self.multi_agent.get_optimized_suggestion(
                             pattern_id=self.pattern_id,
                             failing_tickets=failing_ticket_data,
+                            iteration_context=iteration_context,  # Pass context from pattern DB
                         )
                     )
 
@@ -1251,7 +1434,9 @@ class PatternFixAgent(OkpMcpAgent):
             print(f"💡 Suggestion: {suggestion.suggested_change}\n")
 
             # Apply change
-            if not self.apply_code_change(suggestion, iteration_context=f"Pattern Iteration {iteration}"):
+            if not self.apply_code_change(
+                suggestion, iteration_context=f"Pattern Iteration {iteration}"
+            ):
                 print("❌ Change not applied")
                 continue
 
@@ -1288,7 +1473,9 @@ class PatternFixAgent(OkpMcpAgent):
             print(f"\n{'='*80}")
             print("PATTERN-WIDE IMPACT")
             print(f"{'='*80}")
-            print(f"{'Ticket':<20} {'Baseline F1':<12} {'Current F1':<12} {'Change':<12} {'Status'}")
+            print(
+                f"{'Ticket':<20} {'Baseline F1':<12} {'Current F1':<12} {'Change':<12} {'Status'}"
+            )
             print("-" * 80)
 
             improved_count = 0
@@ -1324,12 +1511,24 @@ class PatternFixAgent(OkpMcpAgent):
             )
             print(f"{'='*80}\n")
 
+            # Record per-ticket iteration data for correlation analysis
+            self._record_per_ticket_iteration(
+                iteration=iteration,
+                cycle=cycle,
+                pattern_scores=pattern_scores,
+                baseline_result=baseline_result,
+            )
+
             # Decision: Commit if net positive (more improved than regressed)
             if improved_count > regressed_count:
-                print(f"✅ Net positive! Committing change ({improved_count} improved > {regressed_count} regressed)")
+                print(
+                    f"✅ Net positive! Committing change ({improved_count} improved > {regressed_count} regressed)"
+                )
                 import subprocess
 
-                subprocess.run(["git", "add", "src/okp_mcp/solr.py"], cwd=self.okp_mcp_root, check=True)
+                subprocess.run(
+                    ["git", "add", "src/okp_mcp/solr.py"], cwd=self.okp_mcp_root, check=True
+                )
                 subprocess.run(
                     ["git", "commit", "-m", f"pattern: {suggestion.suggested_change}"],
                     cwd=self.okp_mcp_root,
@@ -1352,7 +1551,9 @@ class PatternFixAgent(OkpMcpAgent):
                 total_tickets = len(pattern_scores)
                 success_rate = passing_tickets / total_tickets if total_tickets > 0 else 0.0
 
-                print(f"\n📊 Pattern Status: {passing_tickets}/{total_tickets} tickets passing (F1 ≥ 0.5)")
+                print(
+                    f"\n📊 Pattern Status: {passing_tickets}/{total_tickets} tickets passing (F1 ≥ 0.5)"
+                )
 
                 # Exit early if 80%+ of tickets are passing
                 if success_rate >= 0.8:
@@ -1373,37 +1574,362 @@ class PatternFixAgent(OkpMcpAgent):
                     break
 
             else:
-                print(f"❌ Net negative - reverting ({improved_count} improved ≤ {regressed_count} regressed)")
+                print(f"⚠️  Net negative ({improved_count} improved ≤ {regressed_count} regressed)")
+                print("   INCREMENTAL LEARNING: Keeping changes anyway (never revert)")
+                print("   → Multi-agent will see this didn't work and try different approach")
+                print("   → Pattern database tracks unsuccessful attempts")
+                print()
+
+                # Still commit the change (incremental - we build on it, not revert)
                 import subprocess
 
-                subprocess.run(["git", "restore", "src/okp_mcp/solr.py"], cwd=self.okp_mcp_root)
-                self.restart_okp_mcp()
-                iterations_without_improvement += 1  # Count reverts as no improvement
+                try:
+                    subprocess.run(
+                        ["git", "add", "src/okp_mcp/solr.py"], cwd=self.okp_mcp_root, check=True
+                    )
+                    subprocess.run(
+                        [
+                            "git",
+                            "commit",
+                            "-m",
+                            f"pattern (unsuccessful): {suggestion.suggested_change}",
+                        ],
+                        cwd=self.okp_mcp_root,
+                        check=True,
+                    )
+                    commits_made += 1
+                    print(f"   Committed as unsuccessful attempt (for pattern DB context)")
+                except subprocess.CalledProcessError as e:
+                    print(f"   Note: Commit failed (possibly no changes): {e}")
 
-                # Exit early if stuck after too many reverts
+                iterations_without_improvement += 1  # Count unsuccessful as no improvement
+
+                # Exit early if stuck (too many unsuccessful attempts)
                 if iterations_without_improvement >= max_iterations_without_improvement:
                     print(f"\n⚠️  No improvement for {iterations_without_improvement} iterations")
                     print(f"   Early exit at iteration {iteration}/{max_iterations}")
+                    print("   All attempts kept (incremental) - next cycle will build on this")
                     break
 
-        # Final summary
+            # Inner loop summary
+            print(f"\n{'='*80}")
+            print(f"INNER LOOP (Solr Optimization) - Cycle {cycle} COMPLETE")
+            print(f"{'='*80}")
+            print(f"   Solr iterations attempted: {iteration}")
+            print(f"   Changes committed this cycle: {commits_made}")
+            print(f"   Best pattern F1: {best_pattern_f1:.2f}")
+            print(f"{'='*80}\n")
+
+            total_commits_made += commits_made
+
+            # OUTER CHECKPOINT: Full answer validation (~20 min)
+            print(f"\n{'='*80}")
+            print(f"📊 VALIDATION CHECKPOINT - Cycle {cycle}")
+            print(f"{'='*80}")
+            print("   Running FULL evaluation to check answer_correctness...")
+            print("   This includes response generation + LLM judging (~20 min)")
+            print()
+
+            try:
+                # Run full evaluation with response generation
+                answer_result = self.diagnose(ticket_id=None, runs=3, iteration=cycle)
+
+                # Handle both result types
+                if isinstance(answer_result, PatternEvaluationResult):
+                    current_answer = answer_result.pattern_answer_correctness or 0.0
+                    current_faithful = answer_result.pattern_faithfulness or 0.0
+                    current_ctx_rel = getattr(answer_result, "pattern_context_relevance", None)
+                    current_ctx_prec = getattr(answer_result, "pattern_context_precision", None)
+                else:
+                    current_answer = answer_result.answer_correctness or 0.0
+                    current_faithful = answer_result.faithfulness or 0.0
+                    current_ctx_rel = answer_result.context_relevance
+                    current_ctx_prec = answer_result.context_precision
+
+                print(f"\n📊 Cycle {cycle} Results:")
+                print(
+                    f"   Answer Correctness (avg): {current_answer:.2f} (baseline: {best_answer_correctness:.2f})"
+                )
+                print(f"   Faithfulness (avg): {current_faithful:.2f}")
+
+                # Analyze per-ticket changes (if pattern mode)
+                per_ticket_changes = None
+                if isinstance(answer_result, PatternEvaluationResult) and baseline_per_ticket:
+                    per_ticket_changes = self._analyze_per_ticket_changes(
+                        baseline_per_ticket, answer_result
+                    )
+
+                    print(f"\n   Per-Ticket Analysis:")
+                    print(
+                        f"     ✅ Improved to passing (≥0.85): {len(per_ticket_changes['improved_to_passing'])}"
+                    )
+                    if per_ticket_changes["improved_to_passing"]:
+                        for tid in per_ticket_changes["improved_to_passing"]:
+                            ans = answer_result.per_ticket_results[tid].answer_correctness
+                            print(
+                                f"        • {tid}: {baseline_per_ticket[tid]['answer']:.2f} → {ans:.2f}"
+                            )
+
+                    print(f"     📈 Improved: {len(per_ticket_changes['improved'])}")
+                    print(f"     ➡️  Unchanged: {len(per_ticket_changes['unchanged'])}")
+                    print(f"     📉 Regressed: {len(per_ticket_changes['regressed'])}")
+
+                    if per_ticket_changes["catastrophic"]:
+                        print(
+                            f"     ⚠️  CATASTROPHIC regressions: {len(per_ticket_changes['catastrophic'])}"
+                        )
+                        for tid in per_ticket_changes["catastrophic"]:
+                            ans = answer_result.per_ticket_results[tid].answer_correctness
+                            print(
+                                f"        • {tid}: {baseline_per_ticket[tid]['answer']:.2f} → {ans:.2f} (dropped >0.20)"
+                            )
+
+                    print(
+                        f"     Net improvement: {per_ticket_changes['net_improvement']:+d} tickets"
+                    )
+
+                    # Record validation checkpoint with answer_correctness metrics
+                    self._record_validation_checkpoint(
+                        cycle=cycle,
+                        answer_result=answer_result,
+                        baseline_per_ticket=baseline_per_ticket,
+                    )
+                print()
+
+                # Record iteration in pattern database
+                suggestion_summary = (
+                    f"Cycle {cycle}: {commits_made} Solr changes, URL F1 {best_pattern_f1:.2f}"
+                )
+                self.pattern_db.record_iteration(
+                    pattern_id=self.pattern_id,
+                    iteration=iteration_count,
+                    cycle=cycle,
+                    suggested_change=suggestion_summary,
+                    reasoning=f"Inner loop made {commits_made} commits, improved URL F1",
+                    confidence=0.75,  # TODO: Get from multi-agent if available
+                    before_metrics={
+                        "answer": best_answer_correctness,
+                        "url_f1": baseline_result.pattern_url_f1,
+                    },
+                    after_metrics={
+                        "answer": current_answer,
+                        "faithfulness": current_faithful,
+                        "url_f1": best_pattern_f1,
+                    },
+                    committed=commits_made > 0,
+                )
+
+                # Record token usage for this iteration (thesis validation)
+                # Check if pattern context was used (cycle > 1 means we have prior context)
+                used_pattern_context = cycle > 1
+                context_length = len(iteration_context) if iteration_context else 0
+                self.token_tracker.record_iteration_summary(
+                    iteration=iteration_count,
+                    cycle=cycle,
+                    before_answer=best_answer_correctness,
+                    after_answer=current_answer,
+                    used_pattern_context=used_pattern_context,
+                    context_length_tokens=context_length // 4,  # Rough estimate: 4 chars per token
+                )
+
+                # Check if PASSING threshold (early exit success!)
+                passing_threshold = 0.85
+                current_metrics = {
+                    "answer_correctness": current_answer,
+                    "faithfulness": current_faithful,
+                    "context_relevance": current_ctx_rel,
+                    "context_precision": current_ctx_prec,
+                }
+
+                # Determine success based on per-ticket or average
+                should_exit_success = False
+                success_reason = None
+
+                # Pattern mode: Check per-ticket improvements
+                if per_ticket_changes:
+                    # Block success if catastrophic regressions
+                    if per_ticket_changes["catastrophic"]:
+                        print(
+                            f"\n⚠️  Cannot exit: {len(per_ticket_changes['catastrophic'])} catastrophic regressions"
+                        )
+                        print("   Will continue trying to improve")
+                    # Success if any tickets reached passing
+                    elif per_ticket_changes["improved_to_passing"]:
+                        should_exit_success = True
+                        success_reason = f"{len(per_ticket_changes['improved_to_passing'])} ticket(s) improved to passing"
+                    # Success if average passing and net positive
+                    elif (
+                        current_answer >= passing_threshold
+                        and per_ticket_changes["net_improvement"] >= 0
+                    ):
+                        should_exit_success = True
+                        success_reason = f"Average {current_answer:.2f} >= {passing_threshold}, net +{per_ticket_changes['net_improvement']} tickets"
+                # Single ticket mode: Use simple threshold
+                elif self._is_passing(current_metrics, passing_threshold):
+                    should_exit_success = True
+                    success_reason = (
+                        f"Answer correctness {current_answer:.2f} >= {passing_threshold}"
+                    )
+
+                if should_exit_success:
+                    print(f"\n🎉 SUCCESS! {success_reason}")
+                    print(
+                        f"   Achieved in {cycle} validation cycles, {total_commits_made} total commits"
+                    )
+                    print(f"   Early exit - no need for remaining cycles!")
+
+                    # Generate token usage report (thesis validation)
+                    print("\n📊 Generating token usage report...")
+                    self.token_tracker.generate_report()
+                    print()
+
+                    return PhaseResult(
+                        phase_name="retrieval_optimization",
+                        success=True,
+                        iterations=total_commits_made,
+                        final_metrics={
+                            "pattern_f1": best_pattern_f1,
+                            "answer_correctness": current_answer,
+                            "faithfulness": current_faithful,
+                            "commits_made": total_commits_made,
+                            "cycles_completed": cycle,
+                        },
+                        reason=f"PASSING: answer_correctness {current_answer:.2f} >= {passing_threshold}",
+                    )
+
+                # Check if IMPROVED
+                if current_answer > best_answer_correctness:
+                    improvement = current_answer - best_answer_correctness
+                    print(f"✅ IMPROVED! Answer correctness increased by {improvement:+.2f}")
+                    print(f"   {best_answer_correctness:.2f} → {current_answer:.2f}")
+                    print()
+
+                    best_answer_correctness = current_answer
+                    best_per_ticket_result = (
+                        answer_result
+                        if isinstance(answer_result, PatternEvaluationResult)
+                        else None
+                    )
+                    cycles_without_improvement = 0  # Reset counter
+
+                    # Continue to next cycle
+                    if cycle < validation_cycles:
+                        print(
+                            f"   Continuing to cycle {cycle + 1} to see if we can improve further..."
+                        )
+                        print()
+                        continue  # Next outer cycle
+
+                else:
+                    # No improvement or regressed
+                    delta = current_answer - best_answer_correctness
+                    print(f"❌ No improvement in answer quality (delta: {delta:+.2f})")
+                    print(f"   Still keeping changes (incremental learning - never revert)")
+                    print()
+
+                    cycles_without_improvement += 1
+
+                    # Check if stuck
+                    if cycles_without_improvement >= max_cycles_without_improvement:
+                        print(
+                            f"\n⚠️  Stopping: No answer improvement for {cycles_without_improvement} cycles"
+                        )
+                        print(f"   Best answer_correctness: {best_answer_correctness:.2f}")
+                        print(f"   Total commits: {total_commits_made}")
+
+                        return PhaseResult(
+                            phase_name="retrieval_optimization",
+                            success=total_commits_made > 0,
+                            iterations=total_commits_made,
+                            final_metrics={
+                                "pattern_f1": best_pattern_f1,
+                                "answer_correctness": best_answer_correctness,
+                                "commits_made": total_commits_made,
+                                "cycles_completed": cycle,
+                            },
+                            reason=f"Stopped after {cycles_without_improvement} cycles without improvement",
+                        )
+
+            except Exception as e:
+                print(f"❌ Answer validation failed: {e}")
+                import traceback
+
+                traceback.print_exc()
+
+                # Continue to next cycle despite error
+                if cycle < validation_cycles:
+                    print("   Continuing to next cycle despite error...")
+                    continue
+
+        # All cycles complete (reached validation_cycles limit)
         print(f"\n{'='*80}")
-        print("PATTERN OPTIMIZATION COMPLETE")
+        print("ALL VALIDATION CYCLES COMPLETE")
         print(f"{'='*80}")
-        print(f"   Iterations attempted: {max_iterations}")
-        print(f"   Changes committed: {commits_made}")
+        print(f"   Cycles completed: {validation_cycles}")
+        print(f"   Total commits: {total_commits_made}")
+        print(f"   Best answer_correctness (avg): {best_answer_correctness:.2f}")
         print(f"   Best pattern F1: {best_pattern_f1:.2f}")
+
+        # Final per-ticket analysis
+        final_success = False
+        final_reason = f"Completed {validation_cycles} cycles, {total_commits_made} commits"
+
+        if best_per_ticket_result and baseline_per_ticket:
+            final_changes = self._analyze_per_ticket_changes(
+                baseline_per_ticket, best_per_ticket_result
+            )
+
+            print(f"\n   Final Per-Ticket Summary:")
+            print(f"     ✅ Improved to passing: {len(final_changes['improved_to_passing'])}")
+            print(f"     📈 Improved: {len(final_changes['improved'])}")
+            print(f"     📉 Regressed: {len(final_changes['regressed'])}")
+            if final_changes["catastrophic"]:
+                print(f"     ⚠️  Catastrophic: {len(final_changes['catastrophic'])}")
+
+            # Success if any tickets improved to passing AND no catastrophic regressions
+            if final_changes["improved_to_passing"] and not final_changes["catastrophic"]:
+                final_success = True
+                final_reason = f"{len(final_changes['improved_to_passing'])} ticket(s) improved to passing, no catastrophic regressions"
+            # Success if net positive AND no catastrophic regressions
+            elif final_changes["net_improvement"] > 0 and not final_changes["catastrophic"]:
+                final_success = True
+                final_reason = f"Net +{final_changes['net_improvement']} tickets improved, no catastrophic regressions"
+            # Partial success if made commits but no catastrophic regressions
+            elif total_commits_made > 0 and not final_changes["catastrophic"]:
+                final_success = True
+                final_reason = f"{total_commits_made} commits made, no catastrophic regressions (partial progress)"
+            # Fail if catastrophic regressions
+            elif final_changes["catastrophic"]:
+                final_success = False
+                final_reason = (
+                    f"FAIL: {len(final_changes['catastrophic'])} catastrophic regressions"
+                )
+            else:
+                final_success = False
+                final_reason = "No meaningful improvements"
+        else:
+            # Single ticket mode or no per-ticket data: use simple criteria
+            final_success = best_answer_correctness >= 0.85 or total_commits_made > 0
+            final_reason = f"answer={best_answer_correctness:.2f}"
+
         print(f"{'='*80}\n")
+
+        # Generate token usage report (thesis validation)
+        print("📊 Generating token usage report...")
+        self.token_tracker.generate_report()
+        print()
 
         return PhaseResult(
             phase_name="retrieval_optimization",
-            success=commits_made > 0,
-            iterations=iteration_count,
+            success=final_success,
+            iterations=total_commits_made,
             final_metrics={
                 "pattern_f1": best_pattern_f1,
-                "commits_made": commits_made,
+                "answer_correctness": best_answer_correctness,
+                "commits_made": total_commits_made,
+                "cycles_completed": validation_cycles,
             },
-            reason=f"Pattern-wide optimization: {commits_made} changes committed",
+            reason=final_reason,
         )
 
     def run_prompt_optimization(
@@ -1448,15 +1974,11 @@ class PatternFixAgent(OkpMcpAgent):
                     faithful = result.faithfulness or 0.0
 
                 if answer_corr and answer_corr > current_ans_corr:
-                    print(
-                        f"✅ Improved! Answer: {current_ans_corr:.2f} → {answer_corr:.2f}"
-                    )
+                    print(f"✅ Improved! Answer: {current_ans_corr:.2f} → {answer_corr:.2f}")
                     current_ans_corr = answer_corr
 
                 if faithful and faithful > current_faithful:
-                    print(
-                        f"✅ Improved! Faithfulness: {current_faithful:.2f} → {faithful:.2f}"
-                    )
+                    print(f"✅ Improved! Faithfulness: {current_faithful:.2f} → {faithful:.2f}")
                     current_faithful = faithful
 
                 # Early exit if good enough
@@ -1496,9 +2018,21 @@ class PatternFixAgent(OkpMcpAgent):
         Returns:
             True if RAG was not used or returned 0 documents
         """
-        # Check if RAG wasn't called at all
-        if not hasattr(result, "rag_used") or not result.rag_used:
-            return True
+        # For PatternEvaluationResult: check if any URLs were retrieved
+        if hasattr(result, "pattern_url_f1"):
+            # If URL F1 > 0, RAG was definitely used
+            url_f1 = result.pattern_url_f1 or 0.0
+            if url_f1 > 0:
+                return False  # RAG was used
+            # Also check per-ticket results
+            if hasattr(result, "per_ticket_results"):
+                for tres in result.per_ticket_results.values():
+                    if hasattr(tres, "url_f1") and (tres.url_f1 or 0.0) > 0:
+                        return False  # At least one ticket used RAG
+
+        # For single-ticket EvaluationResult: check rag_used attribute
+        if hasattr(result, "rag_used") and result.rag_used:
+            return False
 
         # Check if RAG was called but returned 0 docs
         if hasattr(result, "num_docs_retrieved"):
@@ -1510,6 +2044,7 @@ class PatternFixAgent(OkpMcpAgent):
             contexts_str = str(result.contexts).strip()
             return contexts_str == "" or contexts_str == "[]" or contexts_str == "null"
 
+        # Default: assume RAG was NOT bypassed (safer default)
         return False
 
     def _is_retrieval_problem(self, metrics: Dict) -> bool:
@@ -2201,6 +2736,174 @@ class PatternFixAgent(OkpMcpAgent):
         print(f"\n⏱️  Total Duration: {duration_min:.1f} minutes")
         print("=" * 80 + "\n")
 
+    def _record_per_ticket_iteration(
+        self,
+        iteration: int,
+        cycle: int,
+        pattern_scores: Dict[str, Dict[str, float]],
+        baseline_result: PatternEvaluationResult,
+    ):
+        """Record per-ticket metrics for each iteration (for correlation analysis).
+
+        Args:
+            iteration: Current iteration number
+            cycle: Current validation cycle
+            pattern_scores: Current scores {ticket_id: {"url_f1": float, "mrr": float}}
+            baseline_result: Baseline evaluation result with per_ticket_results
+        """
+        import json
+        from datetime import datetime
+
+        # Create iterations file path
+        iterations_dir = Path(".claude/fix_patterns")
+        iterations_dir.mkdir(parents=True, exist_ok=True)
+        iterations_file = iterations_dir / f"{self.pattern_id}_iterations.jsonl"
+
+        # Record each ticket individually
+        for ticket_id, current_scores in pattern_scores.items():
+            baseline_ticket = baseline_result.per_ticket_results.get(ticket_id)
+            if not baseline_ticket:
+                continue
+
+            # Build iteration record
+            record = {
+                "iteration": iteration,
+                "cycle": cycle,
+                "timestamp": datetime.now().isoformat(),
+                "ticket_id": ticket_id,
+                "baseline_url_f1": baseline_ticket.url_f1 or 0.0,
+                "current_url_f1": current_scores.get("url_f1", 0.0),
+                "url_f1_delta": (current_scores.get("url_f1", 0.0))
+                - (baseline_ticket.url_f1 or 0.0),
+            }
+
+            # Add MRR if available
+            if "mrr" in current_scores:
+                baseline_mrr = baseline_ticket.mrr or 0.0
+                record["baseline_mrr"] = baseline_mrr
+                record["current_mrr"] = current_scores["mrr"]
+                record["mrr_delta"] = current_scores["mrr"] - baseline_mrr
+
+            # Append to file
+            with open(iterations_file, "a") as f:
+                f.write(json.dumps(record) + "\n")
+
+    def _record_validation_checkpoint(
+        self,
+        cycle: int,
+        answer_result: PatternEvaluationResult,
+        baseline_per_ticket: Dict[str, Dict],
+    ):
+        """Record per-ticket answer_correctness at validation checkpoints.
+
+        Args:
+            cycle: Current validation cycle
+            answer_result: Validation result with answer_correctness
+            baseline_per_ticket: Baseline metrics {ticket_id: {"answer": float, "f1": float}}
+        """
+        import json
+        from datetime import datetime
+
+        # Create validation file path
+        validation_dir = Path(".claude/fix_patterns")
+        validation_dir.mkdir(parents=True, exist_ok=True)
+        validation_file = validation_dir / f"{self.pattern_id}_validation_checkpoints.jsonl"
+
+        # Record each ticket's full metrics at this checkpoint
+        for ticket_id, ticket_result in answer_result.per_ticket_results.items():
+            baseline = baseline_per_ticket.get(ticket_id, {})
+
+            record = {
+                "cycle": cycle,
+                "timestamp": datetime.now().isoformat(),
+                "ticket_id": ticket_id,
+                "baseline_url_f1": baseline.get("f1", 0.0),
+                "current_url_f1": ticket_result.url_f1 or 0.0,
+                "url_f1_delta": (ticket_result.url_f1 or 0.0) - baseline.get("f1", 0.0),
+                "baseline_answer_correctness": baseline.get("answer", 0.0),
+                "current_answer_correctness": ticket_result.answer_correctness or 0.0,
+                "answer_correctness_delta": (ticket_result.answer_correctness or 0.0)
+                - baseline.get("answer", 0.0),
+                "faithfulness": ticket_result.faithfulness or 0.0,
+            }
+
+            # Add optional metrics if available
+            if (
+                hasattr(ticket_result, "context_relevance")
+                and ticket_result.context_relevance is not None
+            ):
+                record["context_relevance"] = ticket_result.context_relevance
+            if (
+                hasattr(ticket_result, "context_precision")
+                and ticket_result.context_precision is not None
+            ):
+                record["context_precision"] = ticket_result.context_precision
+
+            # Append to file
+            with open(validation_file, "a") as f:
+                f.write(json.dumps(record) + "\n")
+
+    def _analyze_per_ticket_changes(
+        self,
+        baseline: Dict[str, Dict],
+        current_result: PatternEvaluationResult,
+        passing_threshold: float = 0.85,
+        catastrophic_threshold: float = 0.20,
+    ) -> Dict:
+        """Analyze per-ticket changes from baseline to current.
+
+        Args:
+            baseline: Dict[ticket_id → {"answer": float, "f1": float}]
+            current_result: Current pattern evaluation result
+            passing_threshold: Threshold for "passing" (default 0.85)
+            catastrophic_threshold: Drop that counts as catastrophic (default 0.20)
+
+        Returns:
+            Dict with:
+                - improved_to_passing: List[ticket_id] - tickets that reached passing threshold
+                - improved: List[ticket_id] - tickets that improved but not to passing
+                - unchanged: List[ticket_id] - tickets with <0.05 change
+                - regressed: List[ticket_id] - tickets that got worse
+                - catastrophic: List[ticket_id] - tickets with >0.20 drop
+                - net_improvement: int - (improved count - regressed count)
+        """
+        improved_to_passing = []
+        improved = []
+        unchanged = []
+        regressed = []
+        catastrophic = []
+
+        for tid, current_tres in current_result.per_ticket_results.items():
+            current_answer = current_tres.answer_correctness or 0.0
+            baseline_answer = baseline.get(tid, {}).get("answer", 0.0)
+
+            delta = current_answer - baseline_answer
+
+            # Check if reached passing threshold
+            if current_answer >= passing_threshold and baseline_answer < passing_threshold:
+                improved_to_passing.append(tid)
+            # Check for catastrophic regression
+            elif delta < -catastrophic_threshold:
+                catastrophic.append(tid)
+            # Check for improvement
+            elif delta > 0.05:  # Meaningful improvement
+                improved.append(tid)
+            # Check for regression
+            elif delta < -0.05:  # Meaningful regression
+                regressed.append(tid)
+            # Otherwise unchanged
+            else:
+                unchanged.append(tid)
+
+        return {
+            "improved_to_passing": improved_to_passing,
+            "improved": improved,
+            "unchanged": unchanged,
+            "regressed": regressed,
+            "catastrophic": catastrophic,
+            "net_improvement": len(improved_to_passing) + len(improved) - len(regressed),
+        }
+
     def _is_passing(self, metrics: Dict, answer_threshold: float) -> bool:
         """Check if metrics indicate passing ticket.
 
@@ -2405,11 +3108,15 @@ class PatternFixAgent(OkpMcpAgent):
        --data config/patterns_v2/{result.pattern_id}.yaml
    ```
 
-4. Merge if satisfied:
+4. Create PR if satisfied:
    ```bash
-   git checkout main
-   git merge --squash {result.branch_name}
-   git commit -m "fix: {result.pattern_id} - improved retrieval and answer quality"
+   # Push branch to remote
+   git push -u origin {result.branch_name}
+
+   # Create PR (or use --create-pr flag on next run)
+   gh pr create --title "fix: {result.pattern_id} - improved retrieval quality" \
+                --base main \
+                --head {result.branch_name}
    ```
 """
         else:
@@ -2514,10 +3221,40 @@ def main():
         "--stability-runs", type=int, help="Override number of stability check runs from config"
     )
     parser.add_argument(
+        "--validation-cycles",
+        type=int,
+        help="Max outer loop cycles (answer validations). Each cycle runs inner Solr optimization loop. Default: 1",
+    )
+    parser.add_argument(
         "--mode",
         choices=["single", "full"],
         default="single",
         help="Testing mode: 'single' (one representative ticket) or 'full' (all tickets in pattern)",
+    )
+    parser.add_argument(
+        "--create-pr",
+        action="store_true",
+        help="Create GitHub PR after successful fix (requires gh CLI)",
+    )
+    parser.add_argument(
+        "--no-jira-updates",
+        action="store_true",
+        help="Disable Jira comment updates (default: enabled)",
+    )
+    parser.add_argument(
+        "--dry-run-integrations",
+        action="store_true",
+        help="Preview integration actions without actually executing them",
+    )
+    parser.add_argument(
+        "--include-judge-reasoning",
+        action="store_true",
+        help="Include LLM judge's critique in diagnostic prompts (default: off, for A/B testing)",
+    )
+    parser.add_argument(
+        "--yolo",
+        action="store_true",
+        help="YOLO mode: auto-approve all changes without human review (default: interactive review enabled)",
     )
 
     args = parser.parse_args()
@@ -2538,6 +3275,8 @@ def main():
         config["answer_threshold"] = args.answer_threshold
     if args.stability_runs:
         config["stability_runs"] = args.stability_runs
+    if args.validation_cycles:
+        config["validation_cycles"] = args.validation_cycles
 
     # Validate required paths exist
     for key in ["eval_root", "okp_mcp_root", "lscore_deploy_root"]:
@@ -2551,13 +3290,19 @@ def main():
     print("🚀 Pattern Fix Loop POC")
     print(f"{'='*80}\n")
 
+    # Interactive mode: default True, but can be disabled with --yolo flag
+    interactive_mode = not args.yolo if args.yolo else config.get("interactive", True)
+
     agent = PatternFixAgent(
         pattern_id=args.pattern_id,
         eval_root=Path(config["eval_root"]),
         okp_mcp_root=Path(config["okp_mcp_root"]),
         lscore_deploy_root=Path(config["lscore_deploy_root"]),
-        interactive=config.get("interactive", True),
+        interactive=interactive_mode,
         enable_llm_advisor=config.get("enable_llm_advisor", True),
+        create_pr=args.create_pr,
+        no_jira_updates=args.no_jira_updates,
+        dry_run_integrations=args.dry_run_integrations,
     )
 
     # Load pattern tickets
@@ -2574,6 +3319,7 @@ def main():
             answer_threshold=config["answer_threshold"],
             stability_runs=config["stability_runs"],
             mode=args.mode,
+            validation_cycles=config.get("validation_cycles", 1),  # Default to 1 if not in config
         )
     except KeyboardInterrupt:
         print("\n\n⚠️  Interrupted by user")
@@ -2607,7 +3353,8 @@ def main():
     if result.success:
         print("✅ Pattern fix successful!")
         print(f"   Review: cat {result.diagnostics_dir}/REVIEW_REPORT.md")
-        print(f"   Merge:  git merge --squash {result.branch_name}")
+        print(f"   Branch: {result.branch_name} (ready for PR)")
+        print(f"   Create PR: gh pr create (from {result.branch_name} → main)")
         sys.exit(0)
     else:
         print("❌ Pattern fix failed")

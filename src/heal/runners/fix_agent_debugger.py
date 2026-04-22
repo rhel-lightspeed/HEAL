@@ -10,10 +10,14 @@ This script creates a CHECKPOINT system for rapid iteration:
 5. ✅ ITERATE on multi-agent logic without waiting
 
 Usage:
-    # Use existing fixture
+    # Use existing fixture (okp-mcp path auto-detected from env or ../okp-mcp)
+    python src/heal/runners/fix_agent_debugger.py \
+        --fixture tests/fixtures/bootloader_grub_pattern/baseline_FIXED.json
+
+    # Or specify custom path
     python src/heal/runners/fix_agent_debugger.py \
         --fixture tests/fixtures/bootloader_grub_pattern/baseline_FIXED.json \
-        --okp-mcp-root /home/emackey/Work/okp-mcp
+        --okp-mcp-root /path/to/okp-mcp
 
     # Or use wrapper script
     ./runners/debug.sh BOOTLOADER_GRUB_ISSUES
@@ -63,11 +67,13 @@ class FixAgentDebugger:
         self.fixture_path = fixture_path
         self.okp_mcp_root = okp_mcp_root
 
-        # Set defaults
+        # Set defaults using HEALConfig
+        from heal.core.config import HEALConfig
+
         if eval_root is None:
-            eval_root = Path.home() / "Work/lightspeed-core/lightspeed-evaluation"
+            eval_root = HEALConfig.get_lightspeed_eval_root()
         if lscore_deploy_root is None:
-            lscore_deploy_root = Path.home() / "Work/lscore-deploy"
+            lscore_deploy_root = HEALConfig.get_lscore_deploy_root()
 
         self.eval_root = eval_root
         self.lscore_deploy_root = lscore_deploy_root
@@ -153,8 +159,14 @@ class FixAgentDebugger:
 
         # Calculate pattern-level aggregates
         url_f1_values = [r.url_f1 for r in per_ticket_results.values() if r.url_f1 is not None]
-        answer_values = [r.answer_correctness for r in per_ticket_results.values() if r.answer_correctness is not None]
-        faith_values = [r.faithfulness for r in per_ticket_results.values() if r.faithfulness is not None]
+        answer_values = [
+            r.answer_correctness
+            for r in per_ticket_results.values()
+            if r.answer_correctness is not None
+        ]
+        faith_values = [
+            r.faithfulness for r in per_ticket_results.values() if r.faithfulness is not None
+        ]
 
         pattern_url_f1 = sum(url_f1_values) / len(url_f1_values) if url_f1_values else 0.0
         pattern_answer = sum(answer_values) / len(answer_values) if answer_values else 0.0
@@ -216,9 +228,9 @@ class FixAgentDebugger:
 
     def display_baseline(self, baseline: PatternEvaluationResult):
         """Display baseline metrics (as if from real evaluation)."""
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print(f"📊 BASELINE METRICS (from fixture)")
-        print("="*80)
+        print("=" * 80)
         print(f"   Pattern: {baseline.pattern_id}")
         print(f"   Tickets Evaluated: {len(baseline.per_ticket_results)}")
         print(f"   URL F1 (avg):             {baseline.pattern_url_f1:.2f}")
@@ -236,26 +248,30 @@ class FixAgentDebugger:
         # Show per-ticket breakdown
         print("📋 Per-Ticket Breakdown:")
         print(f"{'Ticket':<15} {'URL F1':<8} {'Answer':<8} {'Faith':<8} {'RAG':<6}")
-        print("-"*80)
+        print("-" * 80)
 
         for ticket_id, result in baseline.per_ticket_results.items():
             url_f1_str = f"{result.url_f1:.2f}" if result.url_f1 is not None else "N/A"
-            answer_str = f"{result.answer_correctness:.2f}" if result.answer_correctness is not None else "N/A"
+            answer_str = (
+                f"{result.answer_correctness:.2f}"
+                if result.answer_correctness is not None
+                else "N/A"
+            )
             faith_str = f"{result.faithfulness:.2f}" if result.faithfulness is not None else "N/A"
             rag_str = "✅" if result.docs_retrieved else "❌"
 
             print(f"{ticket_id:<15} {url_f1_str:<8} {answer_str:<8} {faith_str:<8} {rag_str:<6}")
 
-        print("="*80 + "\n")
+        print("=" * 80 + "\n")
 
     async def test_multi_agent_optimization(self, baseline: PatternEvaluationResult):
         """Test multi-agent Solr optimization logic.
 
         This is the CHECKPOINT - start optimization phase directly!
         """
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("🎯 PHASE 2: MULTI-AGENT PATTERN OPTIMIZATION (DEBUG MODE)")
-        print("="*80)
+        print("=" * 80)
 
         if not self.multi_agent:
             print("⚠️  Multi-agent system not available - skipping")
@@ -310,7 +326,7 @@ class FixAgentDebugger:
             )
 
             print("\n✅ Multi-agent PATTERN analysis complete!")
-            print("="*80)
+            print("=" * 80)
             print(f"📊 Pattern: {self.pattern_id}")
             print(f"🎯 Tickets Addressed: {len(baseline.failing_tickets)}")
             print()
@@ -335,8 +351,10 @@ class FixAgentDebugger:
                 for risk in suggestion.risks:
                     print(f"   • {risk}")
             print()
-            print(f"💡 This fix should improve retrieval for ALL {len(baseline.failing_tickets)} tickets in the pattern")
-            print("="*80)
+            print(
+                f"💡 This fix should improve retrieval for ALL {len(baseline.failing_tickets)} tickets in the pattern"
+            )
+            print("=" * 80)
 
             # Save suggestion to JSON for automatic application
             suggestion_dir = Path(".diagnostics") / self.pattern_id
@@ -358,11 +376,14 @@ class FixAgentDebugger:
                 json.dump(suggestion_data, f, indent=2)
 
             print(f"\n💾 Suggestion saved to: {suggestion_file}")
-            print(f"   Use './runners/eval_fix.sh {self.pattern_id} --apply' to apply automatically")
+            print(
+                f"   Use './runners/eval_fix.sh {self.pattern_id} --apply' to apply automatically"
+            )
 
         except Exception as e:
             print(f"❌ Multi-agent optimization failed: {e}")
             import traceback
+
             traceback.print_exc()
 
     def run(self):
@@ -374,13 +395,13 @@ class FixAgentDebugger:
         3. Run multi-agent optimization (REAL)
         4. Show suggested changes
         """
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("🔧 FIX AGENT DEBUGGER - Pattern Fix Loop Checkpoint")
-        print("="*80)
+        print("=" * 80)
         print(f"Pattern: {self.pattern_id}")
         print(f"Fixture: {self.fixture_path.name}")
         print(f"Mode: DEBUG (skip baseline, load from fixture)")
-        print("="*80)
+        print("=" * 80)
 
         # Step 1: Build baseline from fixture
         baseline = self.build_baseline_result()
@@ -390,6 +411,7 @@ class FixAgentDebugger:
 
         # Step 3: Test multi-agent optimization
         import asyncio
+
         asyncio.run(self.test_multi_agent_optimization(baseline))
 
         print("\n✅ Debug session complete!")
@@ -413,8 +435,8 @@ def main():
     parser.add_argument(
         "--okp-mcp-root",
         type=Path,
-        default=Path.home() / "Work/okp-mcp",
-        help="Path to okp-mcp repository",
+        default=None,
+        help="Path to okp-mcp repository (auto-detected from OKP_MCP_ROOT env var or ../okp-mcp)",
     )
     parser.add_argument(
         "--eval-root",
@@ -430,6 +452,16 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Auto-detect paths if not provided
+    from heal.core.config import HEALConfig
+
+    if args.okp_mcp_root is None:
+        args.okp_mcp_root = HEALConfig.get_okp_mcp_root()
+        if args.okp_mcp_root is None:
+            print("❌ OKP-MCP repository not found")
+            print("   Set OKP_MCP_ROOT env var or use --okp-mcp-root")
+            sys.exit(1)
 
     # Validate paths
     if not args.fixture.exists():

@@ -215,13 +215,13 @@ def main():
     logger.info("Next steps:")
     logger.info("  1. Review pattern YAMLs in config/patterns/")
     logger.info("  2. Test with lightspeed-evaluation:")
-    logger.info("       cd /home/emackey/Work/lightspeed-core/lightspeed-evaluation")
+    logger.info("       cd $LIGHTSPEED_EVAL_ROOT")
     logger.info("       uv run python -m lightspeed_evaluation.runner \\")
     logger.info("         --config config/system_okp_mcp_agent.yaml \\")
-    logger.info(
-        f"         --data /home/emackey/Work/rhel-lightspeed/HEAL/{args.output_dir}/<PATTERN_ID>.yaml \\"
-    )
+    logger.info(f"         --data <HEAL_ROOT>/{args.output_dir}/<PATTERN_ID>.yaml \\")
     logger.info("         --metrics ragas:context_relevance,custom:answer_correctness")
+    logger.info("")
+    logger.info("  (Set LIGHTSPEED_EVAL_ROOT and HEAL_ROOT in your .env or use absolute paths)")
     logger.info("")
 
 

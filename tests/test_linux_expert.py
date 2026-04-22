@@ -11,8 +11,8 @@ import sys
 
 import pytest
 
-from heal.core.linux_expert import LinuxExpertAgent
-from heal.core.solr_expert import VerificationResult
+from heal.agents.linux_expert import LinuxExpertAgent
+from heal.agents.solr_expert import VerificationResult
 
 
 @pytest.mark.asyncio
@@ -163,7 +163,7 @@ async def test_extract_with_verification_propagates_hypothesis_failure(mocker):
 
     This documents current behavior. In production, caller must handle exceptions.
     """
-    from heal.core.solr_expert import SolrExpertAgent
+    from heal.agents.solr_expert import SolrExpertAgent
 
     ticket = {
         "key": "TEST-001",
@@ -191,7 +191,7 @@ async def test_extract_with_verification_propagates_synthesis_failure(mocker):
     Current implementation: If synthesis fails after successful hypothesis+verification,
     the exception propagates. No fallback handling.
     """
-    from heal.core.solr_expert import SolrExpertAgent, VerificationResult
+    from heal.agents.solr_expert import SolrExpertAgent, VerificationResult
 
     ticket = {
         "key": "TEST-002",

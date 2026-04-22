@@ -48,7 +48,12 @@ SRC_ROOT = Path(__file__).parent.parent.parent
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from heal.core import AnswerReviewAgent, LinuxExpertAgent, SolrExpertAgent  # noqa: E402
+from heal.core import (  # noqa: E402
+    AnswerReviewAgent,
+    LinuxExpertAgent,
+    SolrExpertAgent,
+    URLValidationAgent,
+)
 
 # HEAL repository root for file paths
 REPO_ROOT = SRC_ROOT.parent
@@ -216,6 +221,7 @@ async def extract_ticket(
     linux_expert: LinuxExpertAgent,
     solr_expert: SolrExpertAgent,
     reviewer: AnswerReviewAgent,
+    url_validator: URLValidationAgent,
     max_review_iterations: int = 3,
 ) -> dict[str, Any]:
     """Extract query/answer from a single JIRA ticket with autonomous quality review.
@@ -225,6 +231,7 @@ async def extract_ticket(
         linux_expert: Linux Expert Agent
         solr_expert: Solr Expert Agent
         reviewer: Answer Review Agent for quality checks
+        url_validator: URL Validation Agent for verifying retrieved docs
         max_review_iterations: Maximum refinement iterations (default: 3)
 
     Returns:
@@ -237,9 +244,9 @@ async def extract_ticket(
     # Set ticket key for search intelligence logging
     solr_expert.ticket_key = key
 
-    # Extract with autonomous review - returns Conversation object
+    # Extract with autonomous review + URL validation - returns Conversation object
     conversation = await linux_expert.extract_with_autonomous_review(
-        ticket, solr_expert, reviewer, max_iterations=max_review_iterations
+        ticket, solr_expert, reviewer, url_validator, max_iterations=max_review_iterations
     )
 
     # Convert to dict for YAML and filter None values
@@ -306,6 +313,7 @@ async def main():
     solr_expert = SolrExpertAgent()
     linux_expert = LinuxExpertAgent()
     reviewer = AnswerReviewAgent()
+    url_validator = URLValidationAgent()
 
     # Load existing tickets (unless force rebuild)
     existing_tickets = [] if args.force_rebuild else load_existing_yaml(args.output)
@@ -369,6 +377,7 @@ async def main():
                 linux_expert,
                 solr_expert,
                 reviewer,
+                url_validator,
                 max_review_iterations=args.max_review_iterations,
             )
 

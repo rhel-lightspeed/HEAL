@@ -1,0 +1,306 @@
+- conversation_group_id: RSPEED-1774
+  turns:
+  - turn_id: turn1
+    query: What yum repository is the convert2rhel utility available in and how do
+      I install it?
+    expected_response: 'The convert2rhel utility is available from the public Red
+      Hat CDN at cdn-public.redhat.com, not from standard RHEL subscription repositories.
+
+
+      **For RHEL 7:**
+
+
+      Download the package:
+
+      ```
+
+      wget https://cdn-public.redhat.com/content/public/addon/dist/convert2rhel/server/7/7Server/x86_64/os/Packages/c/convert2rhel-2.2.0-1.el7.noarch.rpm
+
+      ```
+
+
+      Install it:
+
+      ```
+
+      yum localinstall convert2rhel-2.2.0-1.el7.noarch.rpm
+
+      ```
+
+
+      **For RHEL 8:**
+
+
+      Configure the repository:
+
+      ```
+
+      curl -o /etc/yum.repos.d/convert2rhel.repo https://cdn-public.redhat.com/content/public/addon/dist/convert2rhel/server/8/8/x86_64/os/convert2rhel.repo
+
+      ```
+
+
+      Install the package:
+
+      ```
+
+      yum install convert2rhel
+
+      ```
+
+
+      **For RHEL 9:**
+
+
+      Configure the repository:
+
+      ```
+
+      curl -o /etc/yum.repos.d/convert2rhel.repo https://cdn-public.redhat.com/content/public/addon/dist/convert2rhel/server/9/9/x86_64/os/convert2rhel.repo
+
+      ```
+
+
+      Install the package:
+
+      ```
+
+      yum install convert2rhel
+
+      ```
+
+
+      The utility is publicly accessible without requiring a Red Hat subscription,
+      since it''s used to convert non-RHEL systems to RHEL.'
+    expected_urls:
+    - https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/9/html/package_manifest/preface/index.html
+    - https://access.redhat.com/solutions/7131889/index.html
+    - https://access.redhat.com/articles/4238681/index.html
+    - https://access.redhat.com/articles/1351473/index.html
+    - https://access.redhat.com/solutions/7084649/index.html
+  description: 'Incorrect answer: Convert2RHEL repository'
+  tag: eval
+- conversation_group_id: RSPEED-1775
+  turns:
+  - turn_id: turn1
+    query: What Linux distributions and versions can I convert to RHEL using Red Hat
+      Insights?
+    expected_response: "Red Hat Insights (accessed through the Red Hat Hybrid Cloud\
+      \ Console) supports web-based conversions for:\n\n- **CentOS Linux 7** \u2192\
+      \ RHEL 7 (64-bit Intel)\n- **CentOS Linux 8** \u2192 RHEL 8 (64-bit Intel)\n\
+      \nInsights provides pre-conversion analysis for CentOS Linux 7 systems and enables\
+      \ converting multiple systems at scale from a browser.\n\nFor other distributions\
+      \ (Oracle Linux 7/8/9, AlmaLinux OS 8/9, Rocky Linux 8/9), use the Convert2RHEL\
+      \ command-line utility or Red Hat Satellite instead of Red Hat Insights."
+    expected_urls:
+    - https://access.redhat.com/solutions/2734011/index.html
+    - https://access.redhat.com/errata/RHEA-2022:5144/index.html
+    - https://access.redhat.com/solutions/4894221/index.html
+    - https://access.redhat.com/solutions/troubleshooting-the-upgrade-from-rhel-7-to-rhel-8/index.html
+    - https://access.redhat.com/articles/7102725/index.html
+  description: 'Incorrect answer: What distro is convertable through Insights'
+  tag: eval
+- conversation_group_id: RSPEED-1811
+  turns:
+  - turn_id: turn1
+    query: What RHEL versions are supported by RHEL System Roles?
+    expected_response: 'RHEL System Roles support varies by individual role.
+
+
+      **Core roles** like network, selinux, timesync, and kdump support **RHEL 6,
+      7, 8, 9, and 10**. Many security-related roles support **RHEL 7, 8, 9, and 10**
+      (examples: nbde_client, nbde_server, certificate, vpn, firewall). Some newer
+      roles only support **RHEL 8, 9, and 10** (crypto_policies, tlog, fapolicyd),
+      while certain specialized roles require **RHEL 9.1 or later** (keylime_server).
+
+
+      **Key support matrix:**
+
+      - **network, kdump, timesync, selinux, ssh, sshd**: RHEL 6, 7, 8, 9, 10
+
+      - **storage, nbde_client, nbde_server, certificate, vpn, firewall**: RHEL 7,
+      8, 9, 10
+
+      - **crypto_policies, tlog, fapolicyd**: RHEL 8, 9, 10
+
+      - **keylime_server**: RHEL 9.1+
+
+
+      The rhel-system-roles package was first introduced for RHEL 7 Extras in August
+      2017, and became available for RHEL 9 in May 2022.
+
+
+      **Control node requirements** (where Ansible runs) are typically RHEL 8, 9,
+      or 10, while remote host management supports broader version ranges.'
+    expected_urls:
+    - https://access.redhat.com/solutions/6726561/index.html
+    - https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/8/html/system_design_guide/design-of-high-availability-system/index.html
+    - https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/8/html/system_design_guide/using-shared-system-certificates_system-design-guide/index.html
+    - https://access.redhat.com/solutions/7093908/index.html
+    - https://access.redhat.com/solutions/5768451/index.html
+  description: 'Incorrect answer: Asking about RHEL versions supported by RHEL System
+    Roles'
+  tag: eval
+- conversation_group_id: RSPEED-1812
+  turns:
+  - turn_id: turn1
+    query: Where can I find the official documentation for RHEL System Roles?
+    expected_response: "RHEL System Roles documentation is available in multiple locations:\n\
+      \n**Primary Documentation Sources:**\n\n1. **Knowledge Base Article 3050101**\
+      \ (https://access.redhat.com/articles/3050101) - This is the central hub for\
+      \ RHEL System Roles. It provides:\n   - Complete overview of all available system\
+      \ roles\n   - Support matrix showing which roles work on RHEL 6, 7, 8, 9, and\
+      \ 10\n   - Remote host and control node requirements\n   - Initial release information\
+      \ for each role\n   - Links to version-specific documentation\n\n2. **Version-Specific\
+      \ Guides** - Each RHEL version has a dedicated \"Automating system administration\
+      \ by using RHEL system roles\" guide:\n   - RHEL 10: https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/10/html/automating_system_administration_by_using_rhel_system_roles/\n\
+      \   - Similar guides exist for RHEL 7, 8, and 9\n   - These guides include detailed\
+      \ procedures, examples, and configuration steps for each role\n\n3. **SAP-Specific\
+      \ Documentation** - For SAP workloads, see the \"Installing RHEL for SAP Solutions\"\
+      \ guide which includes a dedicated chapter on RHEL System Roles for SAP (sap_hana_preconfigure,\
+      \ sap_netweaver_preconfigure, etc.)\n\n4. **Local Documentation** - After installing\
+      \ the `rhel-system-roles` package, use the `ansible-doc` command to view role\
+      \ documentation locally:\n   ```\n   ansible-doc rhel-system-roles.<role_name>\n\
+      \   ```\n\n**What are RHEL System Roles?**\nRHEL System Roles is a collection\
+      \ of Ansible roles and modules providing a stable and consistent configuration\
+      \ interface to automate and manage multiple releases of Red Hat Enterprise Linux.\
+      \ The project is based on the Linux System Roles upstream project."
+    expected_urls:
+    - https://access.redhat.com/solutions/6726561/index.html
+    - https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux_for_sap_solutions/10/html-single/installing_rhel_10_for_sap_solutions/index/index.html
+    - https://access.redhat.com/solutions/2142121/index.html
+    - https://access.redhat.com/solutions/5768451/index.html
+    - https://access.redhat.com/solutions/3347161/index.html
+  description: 'Incorrect answer: Getting links to documentation for RHEL System Roles'
+  tag: eval
+- conversation_group_id: RSPEED-1859
+  turns:
+  - turn_id: turn1
+    query: How do I see the list of deployments on a system using rpm-ostree?
+    expected_response: "Use the `rpm-ostree status` command to display all deployments\
+      \ on an ostree-based system. This command shows:\n\n- The currently booted deployment\
+      \ (marked with * or \u25CF)\n- Staged deployments (if any)\n- Available rollback\
+      \ targets\n- For each deployment: timestamp, version, commit ID, OSName, and\
+      \ RefSpec\n\nExample:\n```\nrpm-ostree status\n```\n\nFor more detailed information\
+      \ including InactiveRequests and commit tree structure:\n```\nrpm-ostree status\
+      \ -v\n```\n\nFor JSON-formatted output:\n```\nrpm-ostree status --json\n```\n\
+      \nThe command is used across RHEL Atomic Host, RHEL for Edge, and Red Hat CoreOS\
+      \ systems to verify the current deployment version and available deployment\
+      \ history. The output displays deployments in order, with the active deployment\
+      \ clearly marked, allowing you to see both the running system state and any\
+      \ available rollback options."
+    expected_urls:
+    - https://access.redhat.com/articles/5942071/index.html
+    - https://access.redhat.com/solutions/70553/index.html
+    - https://access.redhat.com/solutions/3414221/index.html
+    - https://access.redhat.com/solutions/6996362/index.html
+    - https://access.redhat.com/errata/RHBA-2015:1662/index.html
+  description: 'Incorrect answer: show deployments with rpm-ostree'
+  tag: eval
+- conversation_group_id: RSPEED-1929
+  turns:
+  - turn_id: turn1
+    query: How do I rollback my system to a previous version using rpm-ostree?
+    expected_response: 'To rollback to a previous deployment using rpm-ostree:
+
+
+      1. Execute the rollback command:
+
+      ```
+
+      rpm-ostree rollback
+
+      ```
+
+
+      2. Verify which deployment will boot by default:
+
+      ```
+
+      rpm-ostree status
+
+      ```
+
+
+      3. Reboot to activate the rollback:
+
+      ```
+
+      systemctl reboot
+
+      ```
+
+
+      After reboot, the system boots into the previous RHEL for Edge deployment.
+
+
+      **Note**: Commands like `rpm-ostree split --list` and `rpm-ostree transaction
+      rollback <commit-id>` are not valid rpm-ostree commands.'
+    expected_urls:
+    - https://access.redhat.com/documentation/en-us/red_hat_build_of_microshift/4.17/html-single/getting_ready_to_install_microshift/index/index.html
+    - https://access.redhat.com/errata/RHBA-2023:1577/index.html
+    - https://access.redhat.com/articles/2245351/index.html
+    - https://access.redhat.com/solutions/7128710/index.html
+    - https://access.redhat.com/documentation/en-us/red_hat_build_of_microshift/4.18/html-single/embedding_in_a_rhel_for_edge_image/index/index.html
+  description: 'Incorrect answer: rollback with rpm-ostree'
+  tag: eval
+- conversation_group_id: RSPEED-1930
+  turns:
+  - turn_id: turn1
+    query: How do I install packages on a system using rpm-ostree?
+    expected_response: 'To install packages on systems using rpm-ostree (RHEL Atomic
+      Host, RHEL CoreOS, RHEL for Edge):
+
+
+      **Command:**
+
+      ```
+
+      rpm-ostree install <package-name>
+
+      ```
+
+
+      **Critical requirement:** A system reboot is required after installation for
+      the changes to take effect. The package is added to a new deployment/branch,
+      and you must boot into it to use the installed packages.
+
+
+      **Example:**
+
+      ```
+
+      rpm-ostree install oddjob oddjob-mkhomedir
+
+      systemctl reboot
+
+      ```
+
+
+      **Important considerations:**
+
+
+      1. **Red Hat recommendation**: Wherever possible, use containers or system containers
+      to extend functionality rather than adding packages to the rpm-ostree branch
+      via package layering.
+
+
+      2. **Path restrictions**: rpm-ostree install will not allow packages to place
+      binaries in `/opt`. Allowed paths are `/usr`, `/bin`, `/sbin`, `/lib`, and `/lib64`.
+      Packages attempting to install to `/opt` will fail with "error: Unsupported
+      path".
+
+
+      3. **Package layering support**: This feature is fully supported and is called
+      "package layering" - it adds packages on top of the base OSTree image.
+
+
+      To restore default packages after override: `rpm-ostree override reset <package-name>`'
+    expected_urls:
+    - https://access.redhat.com/solutions/678503/index.html
+    - https://access.redhat.com/articles/1789/index.html
+    - https://access.redhat.com/solutions/7034477/index.html
+    - https://access.redhat.com/articles/7098322/index.html
+    - https://access.redhat.com/solutions/5387631/index.html
+  description: 'Incorrect answer: install packages with rpm-ostree'
+  tag: eval

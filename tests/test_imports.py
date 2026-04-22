@@ -30,15 +30,29 @@ def test_import_okp_mcp_pattern_agent():
 
 
 def test_import_linux_expert():
-    """Test LinuxExpertAgent import."""
-    from heal.core.linux_expert import LinuxExpertAgent
+    """Test LinuxExpertAgent import from new location."""
+    from heal.agents.linux_expert import LinuxExpertAgent
+
+    assert LinuxExpertAgent is not None
+
+
+def test_import_linux_expert_backward_compat():
+    """Test LinuxExpertAgent import from old location (backward compatibility)."""
+    from heal.core import LinuxExpertAgent
 
     assert LinuxExpertAgent is not None
 
 
 def test_import_solr_expert():
-    """Test SolrExpertAgent import."""
-    from heal.core.solr_expert import SolrExpertAgent
+    """Test SolrExpertAgent import from new location."""
+    from heal.agents.solr_expert import SolrExpertAgent
+
+    assert SolrExpertAgent is not None
+
+
+def test_import_solr_expert_backward_compat():
+    """Test SolrExpertAgent import from old location (backward compatibility)."""
+    from heal.core import SolrExpertAgent
 
     assert SolrExpertAgent is not None
 

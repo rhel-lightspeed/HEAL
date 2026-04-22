@@ -33,10 +33,56 @@ def extract_mrr_from_reason(reason: str) -> float | None:
     Example: "URL retrieval: F1=0.33, ... Ranking: MRR=0.090, ..."
     """
     import re
-    match = re.search(r'MRR=([\d.]+)', reason)
+
+    match = re.search(r"MRR=([\d.]+)", reason)
     if match:
         return float(match.group(1))
     return None
+
+
+def load_expected_urls_from_pattern_yaml(pattern_id: str, ticket_id: str) -> List[str]:
+    """Load expected URLs for a ticket from pattern YAML config.
+
+    Args:
+        pattern_id: Pattern ID (e.g., "BOOTLOADER_GRUB_ISSUES")
+        ticket_id: Ticket ID (e.g., "RSPEED-1723")
+
+    Returns:
+        List of expected URLs, or empty list if not found
+    """
+    import yaml
+
+    # Find pattern YAML file
+    pattern_yaml = Path(f"config/patterns/{pattern_id}.yaml")
+    if not pattern_yaml.exists():
+        print(f"⚠️  Pattern YAML not found: {pattern_yaml}")
+        return []
+
+    try:
+        with open(pattern_yaml) as f:
+            pattern_data = yaml.safe_load(f)
+
+        # Pattern YAML is a list of tickets
+        if not isinstance(pattern_data, list):
+            print(f"⚠️  Unexpected pattern YAML format (not a list): {pattern_yaml}")
+            return []
+
+        # Find ticket by conversation_group_id
+        for ticket in pattern_data:
+            if ticket.get("conversation_group_id") == ticket_id:
+                # Get first turn's expected_urls
+                turns = ticket.get("turns", [])
+                if turns and isinstance(turns, list) and len(turns) > 0:
+                    first_turn = turns[0]
+                    expected_urls = first_turn.get("expected_urls", [])
+                    return expected_urls if expected_urls else []
+
+        print(f"⚠️  Ticket {ticket_id} not found in pattern YAML: {pattern_yaml}")
+        return []
+
+    except Exception as e:
+        print(f"⚠️  Error loading pattern YAML {pattern_yaml}: {e}")
+        return []
 
 
 def extract_fixtures_from_suite(suite_dir: Path, pattern_id: str) -> Dict[str, Any]:
@@ -119,15 +165,22 @@ def extract_fixtures_from_suite(suite_dir: Path, pattern_id: str) -> Dict[str, A
                                         for call in turn_calls:
                                             if isinstance(call, dict) and "result" in call:
                                                 result = call["result"]
-                                                if isinstance(result, dict) and "contexts" in result:
+                                                if (
+                                                    isinstance(result, dict)
+                                                    and "contexts" in result
+                                                ):
                                                     ctxs = result["contexts"]
                                                     if isinstance(ctxs, list):
                                                         for ctx in ctxs:
                                                             if isinstance(ctx, dict):
                                                                 url = ctx.get("url", "")
                                                                 if url:
-                                                                    url_normalized = url.replace("https://", "").replace("http://", "")
-                                                                    retrieved_urls.append(url_normalized)
+                                                                    url_normalized = url.replace(
+                                                                        "https://", ""
+                                                                    ).replace("http://", "")
+                                                                    retrieved_urls.append(
+                                                                        url_normalized
+                                                                    )
                         except (json.JSONDecodeError, TypeError, KeyError):
                             pass
 
@@ -135,19 +188,26 @@ def extract_fixtures_from_suite(suite_dir: Path, pattern_id: str) -> Dict[str, A
                     rag_used = False
                     if tool_calls:
                         tool_calls_lower = tool_calls.lower()
-                        rag_used = any(kw in tool_calls_lower for kw in ["search", "portal", "retrieve", "mcp"])
+                        rag_used = any(
+                            kw in tool_calls_lower for kw in ["search", "portal", "retrieve", "mcp"]
+                        )
 
                     # Check docs retrieved
                     docs_retrieved = False
                     if contexts:
                         contexts_str = str(contexts).strip()
-                        docs_retrieved = contexts_str != "" and contexts_str != "[]" and contexts_str != "null"
+                        docs_retrieved = (
+                            contexts_str != "" and contexts_str != "[]" and contexts_str != "null"
+                        )
+
+                    # Load expected URLs from pattern YAML
+                    expected_urls = load_expected_urls_from_pattern_yaml(pattern_id, ticket_id)
 
                     # Store metadata (same across all runs)
                     ticket_data[ticket_id]["metadata"] = {
                         "tool_calls": tool_calls,
                         "contexts": contexts,
-                        "expected_urls": [],  # TODO: Load from test config YAML
+                        "expected_urls": expected_urls,
                         "retrieved_urls": retrieved_urls,
                         "rag_used": rag_used,
                         "docs_retrieved": docs_retrieved,
@@ -230,7 +290,7 @@ def main():
     print(f"   Pattern: {fixture['pattern_id']}")
     print(f"   Runs: {fixture['num_runs']}")
     print(f"   Tickets: {len(fixture['per_ticket_data'])}")
-    for ticket_id, data in fixture['per_ticket_data'].items():
+    for ticket_id, data in fixture["per_ticket_data"].items():
         print(f"     • {ticket_id}: {len(data['runs'])} run(s)")
         print(f"       - RAG used: {data['metadata']['rag_used']}")
         print(f"       - Docs retrieved: {data['metadata']['docs_retrieved']}")

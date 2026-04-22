@@ -18,7 +18,9 @@ class TestBuildEvaluationResultLogic:
     def test_metric_averaging_with_single_run(self):
         """Test that single run returns metrics correctly."""
         # Load real fixture
-        per_ticket_results = get_mock_per_ticket_results("bootloader_grub_pattern/run_001_results.json")
+        per_ticket_results = get_mock_per_ticket_results(
+            "bootloader_grub_pattern/run_001_results.json"
+        )
         runs = per_ticket_results["RSPEED-1725"]
 
         # Manual calculation of averages (single run)
@@ -38,7 +40,9 @@ class TestBuildEvaluationResultLogic:
 
     def test_mrr_extraction_from_fixture(self):
         """Test that MRR is extracted correctly from fixture."""
-        per_ticket_results = get_mock_per_ticket_results("bootloader_grub_pattern/run_001_results.json")
+        per_ticket_results = get_mock_per_ticket_results(
+            "bootloader_grub_pattern/run_001_results.json"
+        )
 
         # RSPEED-1725 has MRR=0.09 (from reason field in CSV)
         runs = per_ticket_results["RSPEED-1725"]
@@ -46,7 +50,9 @@ class TestBuildEvaluationResultLogic:
 
     def test_retrieval_problem_detection_logic(self):
         """Test is_retrieval_problem logic with fixture data."""
-        per_ticket_results = get_mock_per_ticket_results("bootloader_grub_pattern/run_001_results.json")
+        per_ticket_results = get_mock_per_ticket_results(
+            "bootloader_grub_pattern/run_001_results.json"
+        )
 
         # RSPEED-1723: F1=0.0 → retrieval problem
         runs_1723 = per_ticket_results["RSPEED-1723"]
@@ -62,16 +68,23 @@ class TestBuildEvaluationResultLogic:
         is_problem = (url_f1_1723 < 0.5) or (mrr_1723 < 0.5) or (ctx_rel_1723 < 0.7)
         assert is_problem is True  # F1=0.0 triggers it
 
+
 class TestPatternAggregationLogic:
     """Test _build_pattern_result aggregation logic."""
 
     def test_pattern_level_averaging(self):
         """Test pattern-level metric averaging."""
-        per_ticket_results = get_mock_per_ticket_results("bootloader_grub_pattern/run_001_results.json")
+        per_ticket_results = get_mock_per_ticket_results(
+            "bootloader_grub_pattern/run_001_results.json"
+        )
 
         # Calculate expected averages
-        url_f1_values = [runs[0]["custom:url_retrieval_eval"] for runs in per_ticket_results.values()]
-        answer_values = [runs[0]["custom:answer_correctness"] for runs in per_ticket_results.values()]
+        url_f1_values = [
+            runs[0]["custom:url_retrieval_eval"] for runs in per_ticket_results.values()
+        ]
+        answer_values = [
+            runs[0]["custom:answer_correctness"] for runs in per_ticket_results.values()
+        ]
 
         expected_avg_f1 = statistics.mean(url_f1_values)
         expected_avg_answer = statistics.mean(answer_values)
@@ -99,7 +112,9 @@ class TestPatternAggregationLogic:
 
     def test_passing_failing_classification_logic(self):
         """Test ticket classification as passing/failing."""
-        per_ticket_results = get_mock_per_ticket_results("bootloader_grub_pattern/run_001_results.json")
+        per_ticket_results = get_mock_per_ticket_results(
+            "bootloader_grub_pattern/run_001_results.json"
+        )
 
         # Calculate composite for each ticket
         composites = {}
@@ -130,7 +145,9 @@ class TestFixtureDataQuality:
 
     def test_fixture_has_all_metrics(self):
         """Verify fixture contains all expected metrics."""
-        per_ticket_results = get_mock_per_ticket_results("bootloader_grub_pattern/run_001_results.json")
+        per_ticket_results = get_mock_per_ticket_results(
+            "bootloader_grub_pattern/run_001_results.json"
+        )
 
         for ticket_id, runs in per_ticket_results.items():
             for run in runs:
@@ -145,7 +162,9 @@ class TestFixtureDataQuality:
 
     def test_fixture_has_mrr(self):
         """Verify fixture has MRR in metric_metadata."""
-        per_ticket_results = get_mock_per_ticket_results("bootloader_grub_pattern/run_001_results.json")
+        per_ticket_results = get_mock_per_ticket_results(
+            "bootloader_grub_pattern/run_001_results.json"
+        )
 
         # RSPEED-1725 should have MRR=0.09 from extraction
         runs = per_ticket_results["RSPEED-1725"]
@@ -155,7 +174,9 @@ class TestFixtureDataQuality:
 
     def test_fixture_has_three_tickets(self):
         """Verify fixture has expected number of tickets."""
-        per_ticket_results = get_mock_per_ticket_results("bootloader_grub_pattern/run_001_results.json")
+        per_ticket_results = get_mock_per_ticket_results(
+            "bootloader_grub_pattern/run_001_results.json"
+        )
 
         assert len(per_ticket_results) == 3
         assert "RSPEED-1723" in per_ticket_results

@@ -12,6 +12,39 @@ from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
+class FixIteration(BaseModel):
+    """Single iteration in an iterative fix cycle."""
+
+    iteration: int
+    cycle: int  # Which outer cycle (1st answer check, 2nd answer check, etc.)
+    timestamp: str
+
+    # Suggestion
+    suggested_change: str
+    reasoning: str
+    confidence: float
+
+    # Metrics before this fix
+    before_url_f1: float
+    before_answer: float
+    before_faithfulness: Optional[float] = None
+
+    # Metrics after this fix
+    after_url_f1: float
+    after_answer: float
+    after_faithfulness: Optional[float] = None
+
+    # Deltas
+    url_f1_delta: float
+    answer_delta: float
+    faithfulness_delta: float = 0.0
+
+    # Outcome
+    improved: bool
+    committed: bool
+    git_commit_hash: Optional[str] = None
+
+
 class FixPattern(BaseModel):
     """A successful fix pattern that can be reused."""
 
@@ -40,8 +73,17 @@ class FixPattern(BaseModel):
 
     # Learning data
     judge_reasoning: Optional[str] = None
-    times_reused: int = Field(default=0, description="How many times this pattern helped other tickets")
-    success_rate_when_reused: float = Field(default=0.0, description="Success rate when applied to similar tickets")
+    times_reused: int = Field(
+        default=0, description="How many times this pattern helped other tickets"
+    )
+    success_rate_when_reused: float = Field(
+        default=0.0, description="Success rate when applied to similar tickets"
+    )
+
+    # Iterative improvement history
+    iterations: List[FixIteration] = Field(
+        default_factory=list, description="All iterations that led to this fix"
+    )
 
 
 class FixPatternDatabase:
@@ -190,9 +232,13 @@ class FixPatternDatabase:
         # Boost confidence if this pattern has been successfully reused
         if best_pattern.times_reused > 0 and best_pattern.success_rate_when_reused > 0.7:
             print(f"🎯 Found high-confidence pattern from {best_pattern.ticket_id}:")
-            print(f"   Reused {best_pattern.times_reused} times with {best_pattern.success_rate_when_reused:.0%} success")
+            print(
+                f"   Reused {best_pattern.times_reused} times with {best_pattern.success_rate_when_reused:.0%} success"
+            )
         else:
-            print(f"💡 Found similar pattern from {best_pattern.ticket_id} (similarity: {best_score:.2f})")
+            print(
+                f"💡 Found similar pattern from {best_pattern.ticket_id} (similarity: {best_score:.2f})"
+            )
 
         return best_pattern
 
@@ -261,7 +307,9 @@ class FixPatternDatabase:
             "success_rate": len(successful) / len(self.patterns),
             "patterns_reused": len(reused),
             "most_common_fixes": most_common[:5],
-            "avg_improvement": sum(p.improvement for p in successful) / len(successful) if successful else 0,
+            "avg_improvement": (
+                sum(p.improvement for p in successful) / len(successful) if successful else 0
+            ),
             "total_cost_saved": sum(p.cost for p in reused),  # Cost of patterns that were reused
         }
 
@@ -301,9 +349,7 @@ class FixPatternDatabase:
         )
 
         high_conf = [
-            p
-            for p in self.patterns
-            if p.times_reused >= 2 and p.success_rate_when_reused >= 0.7
+            p for p in self.patterns if p.times_reused >= 2 and p.success_rate_when_reused >= 0.7
         ]
         high_conf.sort(key=lambda x: x.times_reused, reverse=True)
 
@@ -323,3 +369,183 @@ class FixPatternDatabase:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text("\n".join(lines))
         print(f"📊 Learning report exported to: {output_path}")
+
+    def record_iteration(
+        self,
+        pattern_id: str,
+        iteration: int,
+        cycle: int,
+        suggested_change: str,
+        reasoning: str,
+        confidence: float,
+        before_metrics: Dict[str, float],
+        after_metrics: Dict[str, float],
+        committed: bool,
+        git_commit_hash: Optional[str] = None,
+    ) -> FixIteration:
+        """Record a single iteration in the fix cycle.
+
+        This builds up the iterative history showing how fixes evolved.
+
+        Args:
+            pattern_id: Pattern being fixed
+            iteration: Iteration number within cycle
+            cycle: Outer cycle number (1st answer check, 2nd, etc.)
+            suggested_change: What was changed
+            reasoning: Why it was suggested
+            confidence: Confidence score
+            before_metrics: Metrics before fix
+            after_metrics: Metrics after fix
+            committed: Whether fix was committed
+            git_commit_hash: Git commit if committed
+
+        Returns:
+            FixIteration record
+        """
+        url_f1_delta = after_metrics.get("url_f1", 0) - before_metrics.get("url_f1", 0)
+        answer_delta = after_metrics.get("answer", 0) - before_metrics.get("answer", 0)
+        faith_delta = (
+            after_metrics.get("faithfulness", 0) - before_metrics.get("faithfulness", 0)
+            if before_metrics.get("faithfulness") and after_metrics.get("faithfulness")
+            else 0.0
+        )
+
+        improved = answer_delta > 0.02  # 2% threshold
+
+        iter_record = FixIteration(
+            iteration=iteration,
+            cycle=cycle,
+            timestamp=datetime.now().isoformat(),
+            suggested_change=suggested_change,
+            reasoning=reasoning,
+            confidence=confidence,
+            before_url_f1=before_metrics.get("url_f1", 0),
+            before_answer=before_metrics.get("answer", 0),
+            before_faithfulness=before_metrics.get("faithfulness"),
+            after_url_f1=after_metrics.get("url_f1", 0),
+            after_answer=after_metrics.get("answer", 0),
+            after_faithfulness=after_metrics.get("faithfulness"),
+            url_f1_delta=url_f1_delta,
+            answer_delta=answer_delta,
+            faithfulness_delta=faith_delta,
+            improved=improved,
+            committed=committed,
+            git_commit_hash=git_commit_hash,
+        )
+
+        # Store in pattern-specific iterations file
+        iter_file = self.db_path.parent / f"{pattern_id}_iterations.jsonl"
+        with open(iter_file, "a") as f:
+            f.write(iter_record.model_dump_json() + "\n")
+
+        return iter_record
+
+    def get_iteration_context(self, pattern_id: str) -> str:
+        """Get formatted context of all iterations for multi-agent.
+
+        This provides the agent with complete history of what was tried
+        and what worked, enabling cumulative improvements.
+
+        Args:
+            pattern_id: Pattern being fixed
+
+        Returns:
+            Formatted context string for agent prompt
+        """
+        iter_file = self.db_path.parent / f"{pattern_id}_iterations.jsonl"
+
+        if not iter_file.exists():
+            return (
+                "No prior iterations for this pattern.\n\nThis is the first optimization attempt."
+            )
+
+        # Load iterations
+        iterations = []
+        with open(iter_file) as f:
+            for line in f:
+                if line.strip():
+                    iterations.append(FixIteration.model_validate_json(line))
+
+        if not iterations:
+            return "No prior iterations recorded."
+
+        # Build context
+        lines = []
+        lines.append(f"PRIOR FIX ATTEMPTS FOR {pattern_id}")
+        lines.append("=" * 80)
+        lines.append("")
+
+        # Group by cycle
+        cycles: Dict[int, List[FixIteration]] = {}
+        for it in iterations:
+            if it.cycle not in cycles:
+                cycles[it.cycle] = []
+            cycles[it.cycle].append(it)
+
+        # Show cumulative progress
+        baseline_answer = iterations[0].before_answer if iterations else 0.0
+        best_answer = max((it.after_answer for it in iterations), default=baseline_answer)
+        total_improvement = best_answer - baseline_answer
+
+        lines.append(f"Baseline Answer Correctness: {baseline_answer:.2f}")
+        lines.append(f"Current Best: {best_answer:.2f} (Δ {total_improvement:+.2f})")
+        lines.append(f"Total Iterations: {len(iterations)}")
+        lines.append(f"Committed Fixes: {sum(1 for it in iterations if it.committed)}")
+        lines.append("")
+
+        # Show each cycle
+        for cycle_num in sorted(cycles.keys()):
+            cycle_its = cycles[cycle_num]
+            lines.append(f"CYCLE {cycle_num}:")
+            lines.append("-" * 40)
+
+            for it in cycle_its:
+                status = (
+                    "✅ COMMITTED"
+                    if it.committed
+                    else "❌ REVERTED" if not it.improved else "⏸️  PENDING"
+                )
+                lines.append(f"  Iteration {it.iteration}:")
+                lines.append(f"    Change: {it.suggested_change}")
+                lines.append(
+                    f"    Answer: {it.before_answer:.2f} → {it.after_answer:.2f} (Δ {it.answer_delta:+.2f})"
+                )
+                lines.append(
+                    f"    URL F1: {it.before_url_f1:.2f} → {it.after_url_f1:.2f} (Δ {it.url_f1_delta:+.2f})"
+                )
+                lines.append(f"    Status: {status}")
+                if it.committed and it.git_commit_hash:
+                    lines.append(f"    Git: {it.git_commit_hash[:8]}")
+                lines.append("")
+
+        # Provide guidance for next iteration
+        lines.append("=" * 80)
+        lines.append("GUIDANCE FOR NEXT FIX:")
+        lines.append("")
+
+        # What worked
+        successful = [it for it in iterations if it.committed]
+        if successful:
+            lines.append("✅ Successful changes so far:")
+            for it in successful[-3:]:  # Last 3 successes
+                lines.append(
+                    f"  • {it.suggested_change} → +{it.answer_delta:.2f} answer improvement"
+                )
+            lines.append("")
+            lines.append("→ BUILD ON THESE: Refine and extend what's working!")
+        else:
+            lines.append("⚠️  No successful commits yet.")
+            lines.append("→ Consider a different approach")
+
+        lines.append("")
+
+        # What didn't work
+        failed = [it for it in iterations if not it.improved]
+        if failed:
+            lines.append("❌ Approaches that didn't help:")
+            for it in failed[-2:]:  # Last 2 failures
+                lines.append(f"  • {it.suggested_change}")
+            lines.append("")
+            lines.append("→ AVOID repeating these patterns")
+
+        return "\n".join(lines)

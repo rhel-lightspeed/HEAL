@@ -395,7 +395,9 @@ class PatternEvaluationResult:
         """Human-readable summary of pattern results."""
         lines = [f"Pattern: {self.pattern_id}"]
         lines.append(f"  Tickets Evaluated: {len(self.per_ticket_results)}")
-        lines.append(f"  Success Rate: {self.success_rate:.0%} ({len(self.passing_tickets)}/{len(self.per_ticket_results)})")
+        lines.append(
+            f"  Success Rate: {self.success_rate:.0%} ({len(self.passing_tickets)}/{len(self.per_ticket_results)})"
+        )
         lines.append(f"  Pattern Composite Score: {self.pattern_composite_score:.2f}")
 
         if self.rag_bypass_tickets:
@@ -448,11 +450,8 @@ class OkpMcpAgent:
         if enable_llm_advisor and LLM_ADVISOR_AVAILABLE:
             try:
                 self.llm_advisor = OkpMcpLLMAdvisor(
-                    model="claude-sonnet-4-6",
                     okp_mcp_root=okp_mcp_root,
-                    use_tiered_models=True,
-                    simple_model="claude-haiku-4-5-20251001",
-                    complex_model="claude-opus-4-6",
+                    use_tiered_routing=True,
                 )
                 print("✅ LLM advisor initialized")
             except Exception as e:
@@ -1664,14 +1663,18 @@ class OkpMcpAgent:
             try:
                 # Find NEW suite directory created after we started
                 if current_suite is None:
-                    suite_dirs = sorted(output_base.glob("suite_*"), key=lambda p: p.stat().st_mtime)
+                    suite_dirs = sorted(
+                        output_base.glob("suite_*"), key=lambda p: p.stat().st_mtime
+                    )
                     new_suites = [s for s in suite_dirs if s not in existing_suites]
                     if new_suites:
                         current_suite = new_suites[-1]  # Get the newest one
 
                 if current_suite and current_suite.exists():
                     # Count run directories that have a summary.json file (indicating completion)
-                    completed_runs = len(list(current_suite.glob("run_*/evaluation_*_summary.json")))
+                    completed_runs = len(
+                        list(current_suite.glob("run_*/evaluation_*_summary.json"))
+                    )
 
                     if completed_runs > last_completed:
                         elapsed = time.time() - start_time
@@ -1998,14 +2001,18 @@ class OkpMcpAgent:
             try:
                 # Find NEW suite directory created after we started
                 if current_suite is None:
-                    suite_dirs = sorted(output_base.glob("suite_*"), key=lambda p: p.stat().st_mtime)
+                    suite_dirs = sorted(
+                        output_base.glob("suite_*"), key=lambda p: p.stat().st_mtime
+                    )
                     new_suites = [s for s in suite_dirs if s not in existing_suites]
                     if new_suites:
                         current_suite = new_suites[-1]  # Get the newest one
 
                 if current_suite and current_suite.exists():
                     # Count completed runs by looking for summary.json files
-                    completed_runs = len(list(current_suite.glob("run_*/evaluation_*_summary.json")))
+                    completed_runs = len(
+                        list(current_suite.glob("run_*/evaluation_*_summary.json"))
+                    )
 
                     if completed_runs > last_completed:
                         elapsed = time.time() - start_time
@@ -2469,10 +2476,13 @@ class OkpMcpAgent:
             run_dirs = sorted(output_dir.glob("run_*"))
             for run_dir in run_dirs:
                 try:
-                    run_result = self.parse_results(run_dir.parent, ticket_id)  # Parse from single run
+                    run_result = self.parse_results(
+                        run_dir.parent, ticket_id
+                    )  # Parse from single run
                     csv_files = list(run_dir.glob("evaluation_*_detailed.csv"))
                     if csv_files:
                         import pandas as pd
+
                         df = pd.read_csv(csv_files[0])
 
                         # Filter to ticket if specified
@@ -2484,7 +2494,11 @@ class OkpMcpAgent:
 
                         # Extract scores for this run
                         run_scores = {}
-                        for metric_id in ["custom:answer_correctness", "ragas:faithfulness", "custom:url_retrieval_eval"]:
+                        for metric_id in [
+                            "custom:answer_correctness",
+                            "ragas:faithfulness",
+                            "custom:url_retrieval_eval",
+                        ]:
                             metric_rows = ticket_df[ticket_df["metric_identifier"] == metric_id]
                             if not metric_rows.empty:
                                 run_scores[metric_id] = metric_rows["score"].mean()
@@ -2830,14 +2844,19 @@ class OkpMcpAgent:
                                 for call in turn_calls:
                                     if isinstance(call, dict) and "result" in call:
                                         call_result = call["result"]
-                                        if isinstance(call_result, dict) and "contexts" in call_result:
+                                        if (
+                                            isinstance(call_result, dict)
+                                            and "contexts" in call_result
+                                        ):
                                             ctxs = call_result["contexts"]
                                             if isinstance(ctxs, list):
                                                 for ctx in ctxs:
                                                     if isinstance(ctx, dict):
                                                         url = ctx.get("url", "")
                                                         if url:
-                                                            url_normalized = url.replace("https://", "").replace("http://", "")
+                                                            url_normalized = url.replace(
+                                                                "https://", ""
+                                                            ).replace("http://", "")
                                                             retrieved_urls.append(url_normalized)
                 except (json.JSONDecodeError, TypeError, KeyError):
                     pass
@@ -2853,13 +2872,17 @@ class OkpMcpAgent:
             rag_used = False
             if pd.notna(tool_calls) and tool_calls:
                 tool_calls_str = str(tool_calls).lower()
-                rag_used = any(kw in tool_calls_str for kw in ["search", "portal", "retrieve", "mcp"])
+                rag_used = any(
+                    kw in tool_calls_str for kw in ["search", "portal", "retrieve", "mcp"]
+                )
 
             # Check if documents were retrieved
             docs_retrieved = False
             if pd.notna(contexts) and contexts:
                 contexts_str = str(contexts).strip()
-                docs_retrieved = contexts_str != "" and contexts_str != "[]" and contexts_str != "null"
+                docs_retrieved = (
+                    contexts_str != "" and contexts_str != "[]" and contexts_str != "null"
+                )
 
             # Group by run number to get per-run metrics
             run_numbers = sorted(ticket_df["run_number"].unique())
@@ -2909,7 +2932,7 @@ class OkpMcpAgent:
                     "retrieved_urls": retrieved_urls,
                     "rag_used": rag_used,
                     "docs_retrieved": docs_retrieved,
-                }
+                },
             }
 
         return results
@@ -3406,10 +3429,7 @@ Answer in JSON format:
                     metrics_by_name[metric_name].append(value)
 
         # Average each metric
-        averages = {
-            name: sum(values) / len(values)
-            for name, values in metrics_by_name.items()
-        }
+        averages = {name: sum(values) / len(values) for name, values in metrics_by_name.items()}
 
         # Detect high variance metrics (std > 15% of mean)
         import statistics
@@ -3604,12 +3624,10 @@ Answer in JSON format:
             # Build PatternEvaluationResult
             # Extract pattern ID from config file or use default
             pattern_id = "PATTERN"  # Default for functional test mode
-            if hasattr(self, 'pattern_id') and self.pattern_id:
+            if hasattr(self, "pattern_id") and self.pattern_id:
                 pattern_id = self.pattern_id
 
-            pattern_result = self._build_pattern_result(
-                pattern_id, per_ticket_results, runs
-            )
+            pattern_result = self._build_pattern_result(pattern_id, per_ticket_results, runs)
 
             print(f"✅ Processed {len(per_ticket_results)} tickets")
             return pattern_result
@@ -3631,7 +3649,9 @@ Answer in JSON format:
                     print("=" * 80)
                     print(f"Original query: {solr_query_info['original']}")
                     print(f"Actual Solr query: {solr_query_info['actual']}")
-                    print(f"⚠️  okp-mcp INJECTED terms: {', '.join(solr_query_info['injected_terms'])}")
+                    print(
+                        f"⚠️  okp-mcp INJECTED terms: {', '.join(solr_query_info['injected_terms'])}"
+                    )
                     print()
                     print("💡 These injected terms may be affecting retrieval quality.")
                     print("   Consider whether they're helping or harming the results.")
@@ -3696,7 +3716,7 @@ Answer in JSON format:
 
             # Build PatternEvaluationResult
             pattern_id = "PATTERN"  # Default for functional test mode
-            if hasattr(self, 'pattern_id') and self.pattern_id:
+            if hasattr(self, "pattern_id") and self.pattern_id:
                 pattern_id = self.pattern_id
 
             result = self._build_pattern_result(pattern_id, per_ticket_results, runs)

@@ -12,11 +12,15 @@ from typing import Any
 
 try:
     from claude_agent_sdk import query as claude_query, ClaudeAgentOptions
+
     CLAUDE_SDK_AVAILABLE = True
 except ModuleNotFoundError:
     CLAUDE_SDK_AVAILABLE = False
     claude_query = None
     ClaudeAgentOptions = None
+
+from heal.agents.base_agent import BaseAgent, ModelTierConfig
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -31,14 +35,32 @@ class ReviewResult:
     suggested_fix: str = ""
 
 
-@dataclass
-class AnswerReviewAgent:
+class AnswerReviewAgent(BaseAgent):
     """Reviews extracted answers against production quality guidelines.
 
     Uses Claude Agent SDK to check if answers match production system prompt style.
+    Inherits automatic token tracking and model escalation from BaseAgent.
     """
 
-    model: str = "claude-sonnet-4-5@20250929"
+    def __init__(
+        self,
+        model_tiers: Optional[ModelTierConfig] = None,
+        use_tiered_routing: bool = True,
+        default_model: Optional[str] = None,
+    ):
+        """Initialize Answer Review Agent.
+
+        Args:
+            model_tiers: Model configuration for each tier (simple/medium/complex)
+            use_tiered_routing: Enable automatic model selection by complexity (default: True)
+            default_model: Override model for all tiers (disables routing - only use for testing)
+        """
+        # Don't set default_model - let BaseAgent use its tier defaults (Haiku/Sonnet/Opus)
+        super().__init__(
+            model_tiers=model_tiers,
+            use_tiered_routing=use_tiered_routing,
+            default_model=default_model,  # Only set if explicitly provided
+        )
 
     async def review_answer(
         self,
@@ -161,37 +183,20 @@ Evaluate the answer against production quality guidelines.
 
 Return your review as JSON only."""
 
-        full_prompt = f"""{system_prompt}
+        # Use BaseAgent.query_claude for auto token tracking
+        response = await self.query_claude(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            call_type="review_answer",
+            max_turns=1,
+        )
 
----
+        response_text = response.content
+        logger.debug(f"AnswerReviewer: {response.total_tokens} tokens (${response.cost_usd:.4f})")
 
-{user_prompt}"""
+        # Parse JSON from response
+        json_match = re.search(r"```json\s*(\{.+?\})\s*```", response_text, re.DOTALL)
+        if json_match:
+            response_text = json_match.group(1)
 
-        # Temporarily unset GOOGLE_APPLICATION_CREDENTIALS for Claude SDK
-        saved_google_creds = os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
-
-        try:
-            # Use Claude Agent SDK
-            options = ClaudeAgentOptions(
-                model=self.model,
-                max_turns=1,
-            )
-
-            response_text = ""
-            async for message in claude_query(prompt=full_prompt, options=options):
-                if hasattr(message, "content"):
-                    for block in message.content:
-                        if hasattr(block, "text"):
-                            response_text += block.text
-
-            # Parse JSON from response
-            json_match = re.search(r"```json\s*(\{.+?\})\s*```", response_text, re.DOTALL)
-            if json_match:
-                response_text = json_match.group(1)
-
-            return json.loads(response_text)
-
-        finally:
-            # Restore GOOGLE_APPLICATION_CREDENTIALS for Gemini
-            if saved_google_creds:
-                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = saved_google_creds
+        return json.loads(response_text)

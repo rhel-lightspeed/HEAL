@@ -15,14 +15,16 @@ from typing import TYPE_CHECKING, Any, Optional
 
 try:
     from claude_agent_sdk import query as claude_query, ClaudeAgentOptions
+
     CLAUDE_SDK_AVAILABLE = True
 except ModuleNotFoundError:
     CLAUDE_SDK_AVAILABLE = False
     claude_query = None
     ClaudeAgentOptions = None
 
-from .evaluation_ticket import Conversation, Turn
-from .solr_expert import (
+from heal.core.evaluation_ticket import Conversation, Turn
+from heal.agents.base_agent import BaseAgent, ModelTierConfig
+from heal.agents.solr_expert import (
     SolrExpertAgent,
     VerificationQuery,
     VerificationResult,
@@ -30,19 +32,38 @@ from .solr_expert import (
 
 if TYPE_CHECKING:
     from .answer_review_agent import AnswerReviewAgent
+    from .url_validation_agent import URLValidationAgent
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class LinuxExpertAgent:
+class LinuxExpertAgent(BaseAgent):
     """Linux Expert Agent - forms hypotheses and synthesizes verified answers.
 
     15+ years RHEL expertise, uses Solr Expert for fact verification.
     Uses Claude Agent SDK with Vertex AI for authentication.
+    Inherits automatic token tracking and model escalation from BaseAgent.
     """
 
-    model: str = "claude-sonnet-4-5@20250929"
+    def __init__(
+        self,
+        model_tiers: Optional[ModelTierConfig] = None,
+        use_tiered_routing: bool = True,
+        default_model: Optional[str] = None,
+    ):
+        """Initialize Linux Expert Agent.
+
+        Args:
+            model_tiers: Model configuration for each tier (simple/medium/complex)
+            use_tiered_routing: Enable automatic model selection by complexity (default: True)
+            default_model: Override model for all tiers (disables routing - only use for testing)
+        """
+        # Don't set default_model - let BaseAgent use its tier defaults (Haiku/Sonnet/Opus)
+        super().__init__(
+            model_tiers=model_tiers,
+            use_tiered_routing=use_tiered_routing,
+            default_model=default_model,  # Only set if explicitly provided
+        )
 
     async def extract_with_verification(
         self,
@@ -186,28 +207,17 @@ Description: {description[:800]}
 Does this ticket contain a RHEL technical question (even if reported as "Incorrect answer")?
 Or is it a jailbreak/non-RHEL question?"""
 
-        full_prompt = f"""{system_prompt}
-
----
-
-{user_prompt}"""
-
-        # Temporarily unset GOOGLE_APPLICATION_CREDENTIALS for Claude SDK
-        saved_google_creds = os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
-
         try:
-            # Use Claude Agent SDK for quick classification
-            options = ClaudeAgentOptions(
-                model=self.model,
+            # Use Haiku for fast, cheap scope classification
+            response = await self.query_claude(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=self.model_tiers.simple,  # Haiku for simple classification
+                call_type="scope_check",
                 max_turns=1,
             )
 
-            response_text = ""
-            async for message in claude_query(prompt=full_prompt, options=options):
-                if hasattr(message, "content"):
-                    for block in message.content:
-                        if hasattr(block, "text"):
-                            response_text += block.text
+            response_text = response.content
 
             # Parse JSON
             json_match = re.search(r"```json\s*(\{.+?\})\s*```", response_text, re.DOTALL)
@@ -216,39 +226,40 @@ Or is it a jailbreak/non-RHEL question?"""
 
             result = json.loads(response_text)
             logger.info(f"{key}: Scope check: {result['in_scope']} - {result['reasoning']}")
+            logger.info(f"  Tokens: {response.total_tokens} (${response.cost_usd:.4f})")
             return result
 
         except Exception as e:
             logger.warning(f"{key}: Scope check failed: {e} - defaulting to in_scope=True")
             return {"in_scope": True, "reasoning": f"Scope check error: {e}"}
 
-        finally:
-            # Restore GOOGLE_APPLICATION_CREDENTIALS for Gemini
-            if saved_google_creds:
-                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = saved_google_creds
-
     async def extract_with_autonomous_review(
         self,
         ticket: dict[str, Any],
         solr_expert: SolrExpertAgent,
         reviewer: "AnswerReviewAgent",
+        url_validator: Optional["URLValidationAgent"] = None,
         max_iterations: int = 3,
+        max_search_attempts: int = 2,
     ) -> Conversation:
         """Extract with autonomous review/refinement loop.
 
         Workflow:
             0. Scope check (skip meta-tickets, jailbreaks, non-RHEL)
             1. Form hypothesis and search documentation (once)
-            2. Synthesize answer
-            3. Review Agent checks quality
-            4. If fails: refine using same docs + feedback
-            5. Repeat until passes or max iterations
+            2. URL validation - verify docs answer the question (with retry)
+            3. Synthesize answer
+            4. Review Agent checks quality
+            5. If fails: refine using same docs + feedback
+            6. Repeat until passes or max iterations
 
         Args:
             ticket: JIRA ticket dict
             solr_expert: Solr Expert Agent for verification
             reviewer: Answer Review Agent for quality checks
-            max_iterations: Maximum refinement iterations (default: 3)
+            url_validator: Optional URL Validation Agent (validates URLs before synthesis)
+            max_iterations: Maximum answer refinement iterations (default: 3)
+            max_search_attempts: Maximum search refinement attempts (default: 2)
 
         Returns:
             Conversation object with quality-reviewed answer
@@ -294,24 +305,75 @@ Or is it a jailbreak/non-RHEL question?"""
         logger.info(f"  Hypothesis: {hypothesis_result['hypothesis'][:200]}...")
         logger.info(f"  Verification queries: {len(hypothesis_result['verification_queries'])}")
 
-        # Step 2: Solr Expert verifies facts (ONCE - cache results for iterations)
+        # Step 2: Search + URL validation refinement loop
         verification_queries = [
             VerificationQuery(**vq) for vq in hypothesis_result["verification_queries"]
         ]
 
-        logger.info("\n[Solr Expert] Searching for verification...")
-        verification = await solr_expert.search_for_verification(verification_queries)
+        verification = None
+        url_validation = None
 
-        logger.info(f"  Found: {len(verification.found_docs)} documents")
-        logger.info(f"  Confidence: {verification.confidence}")
-        logger.info(f"  Sources: {len(verification.source_urls)} URLs")
+        for search_attempt in range(max_search_attempts):
+            logger.info(
+                f"\n[Solr Expert] Searching (attempt {search_attempt + 1}/{max_search_attempts})..."
+            )
+            verification = await solr_expert.search_for_verification(verification_queries)
 
-        # Iterative refinement loop
+            logger.info(f"  Found: {len(verification.found_docs)} documents")
+            logger.info(f"  Confidence: {verification.confidence}")
+            logger.info(f"  Sources: {len(verification.source_urls)} URLs")
+
+            # Validate URLs if validator provided
+            if url_validator and verification.found_docs:
+                logger.info("\n[URL Validation] Checking if docs answer the query...")
+                url_validation = await url_validator.validate_urls(
+                    query=hypothesis_result["query"],
+                    hypothesis=hypothesis_result["hypothesis"],
+                    retrieved_docs=verification.found_docs,
+                )
+
+                logger.info(f"  Validation score: {url_validation.score:.2f}")
+                logger.info(f"  Validation passes: {url_validation.passes}")
+
+                if url_validation.passes:
+                    logger.info(f"  ✅ URLs validated on attempt {search_attempt + 1}")
+                    break
+                else:
+                    logger.info("  ❌ URL validation failed:")
+                    for issue in url_validation.issues:
+                        logger.info(f"     - {issue}")
+
+                    if (
+                        search_attempt < max_search_attempts - 1
+                        and url_validation.suggested_search_queries
+                    ):
+                        logger.info(
+                            f"  🔄 Retrying search with {len(url_validation.suggested_search_queries)} suggested queries..."
+                        )
+                        # Convert suggested queries to VerificationQuery format
+                        verification_queries = [
+                            VerificationQuery(
+                                query=sq,
+                                context=f"Refinement attempt {search_attempt + 2}",
+                                expected_doc_type="documentation",
+                            )
+                            for sq in url_validation.suggested_search_queries
+                        ]
+                    else:
+                        logger.info(
+                            "  ⚠️  Max search attempts reached or no suggestions, proceeding with current URLs"
+                        )
+                        break
+            else:
+                # No validator or no docs - proceed with what we have
+                break
+
+        # Step 3: Answer synthesis + review refinement loop (uses validated URLs)
         conversation = None
         review = None  # Initialize for first iteration
+        all_feedback = []  # Combined feedback from both critics
 
         for iteration in range(max_iterations):
-            # Step 3: Synthesize answer
             logger.info(
                 f"\n[Linux Expert] Synthesizing answer (iteration {iteration + 1}/{max_iterations})..."
             )
@@ -327,8 +389,12 @@ Or is it a jailbreak/non-RHEL question?"""
                 expected_response = review.suggested_fix
             else:
                 # Re-synthesize with feedback from previous iteration if any
-                if iteration > 0 and review:
-                    logger.info(f"  Re-synthesizing with feedback: {len(review.issues)} issues")
+                if iteration > 0 and all_feedback:
+                    logger.info(
+                        f"  Re-synthesizing with combined feedback: {len(all_feedback)} issues"
+                    )
+                    for fb in all_feedback[:3]:  # Show first 3
+                        logger.info(f"    - {fb[:80]}...")
 
                 final_answer = await self._synthesize_verified_answer(
                     key,
@@ -336,7 +402,7 @@ Or is it a jailbreak/non-RHEL question?"""
                     description,
                     hypothesis_result,
                     verification,
-                    feedback=review.issues if iteration > 0 and review else None,
+                    feedback=all_feedback if iteration > 0 and all_feedback else None,
                 )
 
                 logger.info(f"  Synthesis confidence: {final_answer['confidence']}")
@@ -359,27 +425,84 @@ Or is it a jailbreak/non-RHEL question?"""
                 description=summary if summary else None,
             )
 
-            # Step 4: Review quality
-            logger.info("\n[Review Agent] Checking answer quality...")
+            # Step 4: Multi-Judge Panel Review (collect ALL feedback before iterating)
+            logger.info("\n[Multi-Judge Panel] Checking answer quality...")
+
+            # Clear feedback from previous iteration
+            all_feedback = []
+
+            # Judge 1: AnswerReviewAgent - structural quality
+            logger.info("  Judge 1: AnswerReviewAgent (structural quality)...")
             review = await reviewer.review_answer(
                 turn.query,
                 turn.expected_response or "",
                 turn.expected_urls or [],
             )
+            logger.info(f"    Score: {review.score:.2f}, Passes: {review.passes}")
 
-            logger.info(f"  Review score: {review.score:.2f}")
-            logger.info(f"  Review passes: {review.passes}")
+            # Collect structural feedback
+            if not review.passes and review.issues:
+                logger.info(f"  Structural issues found: {len(review.issues)}")
+                for issue in review.issues[:3]:  # Show first 3
+                    logger.info(f"    - {issue}")
+                all_feedback.extend(review.issues)
 
-            if review.passes:
-                logger.info(f"  ✅ Passed quality review on iteration {iteration + 1}")
+            # Judge 2: LinuxExpert self-critique - technical accuracy
+            # ALWAYS run this (even if structural review failed) to get comprehensive feedback
+            logger.info("  Judge 2: LinuxExpert self-critique (technical accuracy)...")
+            self_eval = await self.evaluate_answer(
+                query=turn.query,
+                answer=turn.expected_response or "",
+                contexts=turn.contexts or [],
+            )
+            logger.info(f"    Correctness:  {self_eval['correctness']:.2f}")
+            logger.info(f"    Completeness: {self_eval['completeness']:.2f}")
+            logger.info(f"    Faithfulness: {self_eval['faithfulness']:.2f}")
+            logger.info(f"    Overall:      {self_eval['overall_score']:.2f}")
+
+            expert_passes = self_eval["overall_score"] >= 0.70
+
+            # Collect technical feedback if not passing
+            if not expert_passes:
+                expert_notes = self_eval.get("notes", "")
+                if expert_notes and expert_notes != "Evaluation completed":
+                    all_feedback.append(f"[Technical] {expert_notes}")
+
+                # Add specific dimension feedback
+                if self_eval["correctness"] < 0.7:
+                    all_feedback.append(
+                        f"[Technical] Correctness needs improvement (scored {self_eval['correctness']:.2f}/1.0)"
+                    )
+                if self_eval["completeness"] < 0.7:
+                    all_feedback.append(
+                        f"[Technical] Answer incomplete (scored {self_eval['completeness']:.2f}/1.0)"
+                    )
+                if self_eval["faithfulness"] < 0.7:
+                    all_feedback.append(
+                        f"[Technical] Not faithful to sources (scored {self_eval['faithfulness']:.2f}/1.0)"
+                    )
+
+            # Combined verdict
+            both_pass = review.passes and expert_passes
+
+            logger.info(f"\n  Combined verdict:")
+            logger.info(
+                f"    AnswerReviewer: {'✅ PASS' if review.passes else '❌ FAIL'} ({review.score:.2f})"
+            )
+            logger.info(
+                f"    LinuxExpert:    {'✅ PASS' if expert_passes else '❌ FAIL'} ({self_eval['overall_score']:.2f})"
+            )
+            logger.info(f"    Final:          {'✅ PASS' if both_pass else '❌ FAIL'}")
+
+            if both_pass:
+                logger.info(f"  ✅ Passed both judges on iteration {iteration + 1}")
                 break
             else:
-                logger.info("  ❌ Failed quality review:")
-                for issue in review.issues:
-                    logger.info(f"     - {issue}")
-
+                logger.info(f"  ❌ Failed review with {len(all_feedback)} issues total")
                 if iteration < max_iterations - 1:
-                    logger.info("  🔄 Refining answer with feedback...")
+                    logger.info(
+                        f"  🔄 Next iteration will address ALL feedback (structural + technical)"
+                    )
                 else:
                     logger.info("  ⚠️  Max iterations reached, keeping best attempt")
 
@@ -461,35 +584,31 @@ Extract the user query, form your hypothesis about the correct answer, and gener
 
 Return your response as JSON only."""
 
-        # Temporarily unset GOOGLE_APPLICATION_CREDENTIALS for Claude SDK
-        saved_google_creds = os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+        # Use BaseAgent.query_claude for auto token tracking
+        response = await self.query_claude(
+            system_prompt=system_prompt,
+            user_prompt=f"""Analyze this JIRA ticket:
 
-        try:
-            # Use Claude Agent SDK - iterate async generator
-            options = ClaudeAgentOptions(
-                model=self.model,
-                max_turns=1,
-            )
+Ticket: {key}
+Summary: {summary}
+Description: {description}
 
-            response_text = ""
-            async for message in claude_query(prompt=full_prompt, options=options):
-                # Extract text from AssistantMessage content blocks
-                if hasattr(message, "content"):
-                    for block in message.content:
-                        if hasattr(block, "text"):
-                            response_text += block.text
+Extract the user query, form your hypothesis about the correct answer, and generate verification queries to check facts in RHEL documentation.
 
-            # Parse JSON from response
-            json_match = re.search(r"```json\s*(\{.+?\})\s*```", response_text, re.DOTALL)
-            if json_match:
-                response_text = json_match.group(1)
+Return your response as JSON only.""",
+            call_type="form_hypothesis",
+            max_turns=1,
+        )
 
-            return json.loads(response_text)
+        response_text = response.content
+        logger.info(f"  Tokens: {response.total_tokens} (${response.cost_usd:.4f})")
 
-        finally:
-            # Restore GOOGLE_APPLICATION_CREDENTIALS for Gemini
-            if saved_google_creds:
-                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = saved_google_creds
+        # Parse JSON from response
+        json_match = re.search(r"```json\s*(\{.+?\})\s*```", response_text, re.DOTALL)
+        if json_match:
+            response_text = json_match.group(1)
+
+        return json.loads(response_text)
 
     async def _synthesize_verified_answer(
         self,
@@ -619,42 +738,183 @@ IMPORTANT: Return the source URLs listed above in your "sources" field. These ar
 
 Return your response as JSON only."""
 
-        # Combine system prompt + user task into single prompt
-        full_prompt = f"""{system_prompt}
+        # Use BaseAgent.query_claude for auto token tracking
+        response = await self.query_claude(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            call_type="synthesize_answer",
+            max_turns=1,
+        )
 
----
+        response_text = response.content
+        logger.info(f"  Tokens: {response.total_tokens} (${response.cost_usd:.4f})")
 
-{user_prompt}"""
+        # Parse JSON
+        json_match = re.search(r"```json\s*(\{.+?\})\s*```", response_text, re.DOTALL)
+        if json_match:
+            response_text = json_match.group(1)
 
-        # Temporarily unset GOOGLE_APPLICATION_CREDENTIALS for Claude SDK
-        saved_google_creds = os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+        return json.loads(response_text)
+
+    async def evaluate_answer(
+        self,
+        query: str,
+        answer: str,
+        contexts: list[str],
+    ) -> dict[str, Any]:
+        """Evaluate answer quality as a technical expert.
+
+        Uses 15+ years RHEL expertise to judge:
+        - Technical correctness
+        - Completeness
+        - Faithfulness to source documents
+
+        Args:
+            query: User's technical question
+            answer: Answer to evaluate
+            contexts: Source documents used for the answer
+
+        Returns:
+            Dict with scores and notes:
+            {
+                "correctness": 0.0-1.0,
+                "completeness": 0.0-1.0,
+                "faithfulness": 0.0-1.0,
+                "overall_score": 0.0-1.0,
+                "notes": "Explanation of scoring"
+            }
+        """
+        if not CLAUDE_SDK_AVAILABLE:
+            raise RuntimeError(
+                "claude-agent-sdk is not installed. "
+                "Install it with: uv pip install claude-agent-sdk"
+            )
+
+        # Format contexts for prompt
+        context_summary = "\n".join(
+            f"**Source {i+1}:**\n{ctx[:500]}..." for i, ctx in enumerate(contexts[:3])
+        )
+
+        system_prompt = """You are a senior RHEL technical expert with 15+ years experience evaluating answer quality.
+
+**Your Task:**
+Evaluate this answer on three dimensions (scale 0.0 to 1.0):
+
+1. **Correctness** (0.0-1.0): Is the technical information accurate? Are commands, paths, and procedures correct for RHEL?
+
+2. **Completeness** (0.0-1.0): Does it fully answer the question? Are critical steps or information missing?
+
+3. **Faithfulness** (0.0-1.0): Does it stay faithful to the source documents? Are there hallucinations or unsupported claims?
+
+**Respond with ONLY a JSON object:**
+```json
+{
+  "correctness": 0.0-1.0,
+  "completeness": 0.0-1.0,
+  "faithfulness": 0.0-1.0,
+  "overall_score": 0.0-1.0,
+  "notes": "Brief explanation of your scoring (2-3 sentences)"
+}
+```
+
+Be strict but fair. Production RHEL documentation must be highly accurate."""
+
+        user_prompt = f"""**User Question:**
+{query}
+
+**Answer to Evaluate:**
+{answer[:1000]}{"..." if len(answer) > 1000 else ""}
+
+**Source Documents Provided:**
+{context_summary}"""
 
         try:
-            # Use Claude Agent SDK - iterate async generator
-            options = ClaudeAgentOptions(
-                model=self.model,
+            # Use BaseAgent.query_claude for auto token tracking
+            response = await self.query_claude(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                call_type="evaluate_answer",
                 max_turns=1,
             )
 
-            response_text = ""
-            async for message in claude_query(prompt=full_prompt, options=options):
-                # Extract text from AssistantMessage content blocks
-                if hasattr(message, "content"):
-                    for block in message.content:
-                        if hasattr(block, "text"):
-                            response_text += block.text
+            response_text = response.content
+            logger.info(
+                f"LinuxExpert evaluation: {response.total_tokens} tokens (${response.cost_usd:.4f})"
+            )
 
-            # Parse JSON
-            json_match = re.search(r"```json\s*(\{.+?\})\s*```", response_text, re.DOTALL)
-            if json_match:
-                response_text = json_match.group(1)
+            # Parse JSON from response
+            if response_text:
 
-            return json.loads(response_text)
+                # Debug: log first part of response
+                if len(response_text) > 0:
+                    logger.debug(f"LinuxExpert evaluation response (first 500 chars):")
+                    logger.debug(response_text[:500])
 
-        finally:
-            # Restore GOOGLE_APPLICATION_CREDENTIALS for Gemini
-            if saved_google_creds:
-                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = saved_google_creds
+                # Try to extract JSON from markdown code blocks first
+                code_block_match = re.search(
+                    r"```(?:json)?\s*(\{.*?\})\s*```", response_text, re.DOTALL
+                )
+                if code_block_match:
+                    json_text = code_block_match.group(1)
+                else:
+                    # Try to find raw JSON
+                    json_match = re.search(
+                        r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", response_text, re.DOTALL
+                    )
+                    if json_match:
+                        json_text = json_match.group()
+                    else:
+                        json_text = None
+
+                if json_text:
+                    try:
+                        result = json.loads(json_text)
+
+                        # Validate and return
+                        return {
+                            "correctness": float(result.get("correctness", 0.5)),
+                            "completeness": float(result.get("completeness", 0.5)),
+                            "faithfulness": float(result.get("faithfulness", 0.5)),
+                            "overall_score": float(result.get("overall_score", 0.5)),
+                            "notes": str(result.get("notes", "Evaluation completed")),
+                        }
+                    except (json.JSONDecodeError, ValueError) as e:
+                        # Try to fix common JSON issues
+                        # Replace single quotes with double quotes
+                        try:
+                            fixed_json = json_text.replace("'", '"')
+                            result = json.loads(fixed_json)
+                            return {
+                                "correctness": float(result.get("correctness", 0.5)),
+                                "completeness": float(result.get("completeness", 0.5)),
+                                "faithfulness": float(result.get("faithfulness", 0.5)),
+                                "overall_score": float(result.get("overall_score", 0.5)),
+                                "notes": str(result.get("notes", "Evaluation completed")),
+                            }
+                        except Exception as e2:
+                            logger.warning(
+                                f"Failed to parse evaluation JSON even after fixing quotes: {e} / {e2}"
+                            )
+                            logger.warning(f"JSON text (first 300 chars): {json_text[:300]}")
+
+            # Fallback if parsing failed
+            return {
+                "correctness": 0.5,
+                "completeness": 0.5,
+                "faithfulness": 0.5,
+                "overall_score": 0.5,
+                "notes": "Failed to parse evaluation response",
+            }
+
+        except Exception as e:
+            logger.error(f"Error in evaluate_answer: {e}")
+            return {
+                "correctness": 0.5,
+                "completeness": 0.5,
+                "faithfulness": 0.5,
+                "overall_score": 0.5,
+                "notes": f"Evaluation error: {str(e)[:100]}",
+            }
 
     def _extract_description(self, description: Any) -> str:
         """Extract plain text from Atlassian Document Format (ADF).
