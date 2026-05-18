@@ -67,6 +67,7 @@ Description=HEAL hitch trigger (touch-to-run)
 
 [Path]
 PathExists=${PROJECT_ROOT}/.heal-trigger
+Unit=${SERVICE_NAME}.service
 
 [Install]
 WantedBy=default.target
