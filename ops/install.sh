@@ -10,7 +10,7 @@
 #
 # Prerequisites:
 #   - systemd with user session (loginctl enable-linger $USER)
-#   - Environment file at ~/.config/heal/env (see ops/README.md)
+#   - Environment file at ~/.heal/env (see ops/README.md)
 
 set -euo pipefail
 
@@ -18,7 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 UNIT_DIR="${HOME}/.config/systemd/user"
-ENV_FILE="${HOME}/.config/heal/env"
+ENV_FILE="${HOME}/.heal/env"
 SERVICE_NAME="heal-fix"
 
 TIMER_INTERVAL="${HEAL_TIMER_INTERVAL:-4h}"
@@ -89,8 +89,8 @@ do_install() {
         echo "⚠  No environment file at ${ENV_FILE}"
         echo "   Create it with your Vertex AI credentials:"
         echo ""
-        echo "   mkdir -p ~/.config/heal"
-        echo "   cat > ~/.config/heal/env <<'ENVEOF'"
+        echo "   mkdir -p ~/.heal"
+        echo "   cat > ~/.heal/env <<'ENVEOF'"
         echo "   CLAUDE_CODE_USE_VERTEX=1"
         echo "   ANTHROPIC_VERTEX_PROJECT_ID=your-project-id"
         echo "   CLOUD_ML_REGION=global"

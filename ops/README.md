@@ -21,8 +21,8 @@ HEAL's `runners/fix.sh` runs a single fix cycle and exits. The **hitch** connect
 systemd services don't source `.bashrc`. Put your credentials in a file:
 
 ```bash
-mkdir -p ~/.config/heal
-cat > ~/.config/heal/env <<'EOF'
+mkdir -p ~/.heal
+cat > ~/.heal/env <<'EOF'
 CLAUDE_CODE_USE_VERTEX=1
 ANTHROPIC_VERTEX_PROJECT_ID=your-project-id
 CLOUD_ML_REGION=global
