@@ -92,8 +92,7 @@ preflight() {
     fi
 
     # Check pattern files exist
-    if [[ ! -d "${PROJECT_ROOT}/config/patterns" ]] || \
-       [[ -z "$(ls -A "${PROJECT_ROOT}/config/patterns/" 2>/dev/null)" ]]; then
+    if [[ ! -d "${PROJECT_ROOT}/config/patterns" ]]; then
         echo "✗ No pattern files in config/patterns/"
         echo "  Run the data pipeline first:"
         echo ""
@@ -104,8 +103,14 @@ preflight() {
         errors=$((errors + 1))
     else
         local count
-        count=$(ls "${PROJECT_ROOT}/config/patterns/"*.yaml 2>/dev/null | wc -l)
-        echo "✓ Pattern files: ${count} patterns in config/patterns/"
+        count=$(find "${PROJECT_ROOT}/config/patterns" -maxdepth 1 -type f -name '*.yaml' | wc -l)
+        if [[ "${count}" -eq 0 ]]; then
+            echo "✗ No YAML pattern files in config/patterns/"
+            echo "  Run: ./runners/pattern.sh && ./runners/split.sh"
+            errors=$((errors + 1))
+        else
+            echo "✓ Pattern files: ${count} patterns in config/patterns/"
+        fi
     fi
 
     # Check linger
