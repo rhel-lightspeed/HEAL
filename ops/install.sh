@@ -11,6 +11,7 @@
 # Prerequisites:
 #   - systemd with user session (loginctl enable-linger $USER)
 #   - Environment file at ~/.heal/env (see ops/README.md)
+#   - Pattern files in config/patterns/ (run extract → pattern → split first)
 
 set -euo pipefail
 
@@ -75,33 +76,81 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Preflight checks
+# ---------------------------------------------------------------------------
+
+preflight() {
+    local errors=0
+
+    # Check env file
+    if [[ ! -f "${ENV_FILE}" ]]; then
+        echo "✗ No environment file at ${ENV_FILE}"
+        echo "  Create it with your Vertex AI credentials (see ops/README.md)."
+        errors=$((errors + 1))
+    else
+        echo "✓ Environment file: ${ENV_FILE}"
+    fi
+
+    # Check pattern files exist
+    if [[ ! -d "${PROJECT_ROOT}/config/patterns" ]] || \
+       [[ -z "$(ls -A "${PROJECT_ROOT}/config/patterns/" 2>/dev/null)" ]]; then
+        echo "✗ No pattern files in config/patterns/"
+        echo "  Run the data pipeline first:"
+        echo ""
+        echo "    ./runners/extract.sh          # 1. Extract tickets from JIRA"
+        echo "    ./runners/pattern.sh           # 2. Discover patterns"
+        echo "    ./runners/split.sh             # 3. Split into pattern YAMLs"
+        echo ""
+        errors=$((errors + 1))
+    else
+        local count
+        count=$(ls "${PROJECT_ROOT}/config/patterns/"*.yaml 2>/dev/null | wc -l)
+        echo "✓ Pattern files: ${count} patterns in config/patterns/"
+    fi
+
+    # Check linger
+    if command -v loginctl &>/dev/null; then
+        local linger
+        linger=$(loginctl show-user "$USER" -p Linger 2>/dev/null | cut -d= -f2)
+        if [[ "${linger}" != "yes" ]]; then
+            echo "✗ User linger not enabled (services won't survive logout)"
+            echo "  Run: sudo loginctl enable-linger $USER"
+            errors=$((errors + 1))
+        else
+            echo "✓ User linger: enabled"
+        fi
+    fi
+
+    # Check persistent journald
+    if [[ ! -d /var/log/journal ]]; then
+        echo "⚠ Persistent journald not configured (logs will be lost on reboot)"
+        echo "  See ops/README.md step 3 for setup instructions."
+        # Warning only, not a hard error
+    else
+        echo "✓ Persistent journald: enabled"
+    fi
+
+    if [[ ${errors} -gt 0 ]]; then
+        echo ""
+        echo "Fix the above errors before installing."
+        exit 1
+    fi
+
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
 
 do_install() {
-    echo "Installing HEAL hitch systemd units…"
-    echo "  Project root : ${PROJECT_ROOT}"
+    echo "HEAL hitch installer"
+    echo "────────────────────"
+    echo "  Project root  : ${PROJECT_ROOT}"
     echo "  Timer interval: ${TIMER_INTERVAL}"
-    echo "  Env file     : ${ENV_FILE}"
     echo ""
 
-    # Check env file
-    if [[ ! -f "${ENV_FILE}" ]]; then
-        echo "⚠  No environment file at ${ENV_FILE}"
-        echo "   Create it with your Vertex AI credentials:"
-        echo ""
-        echo "   mkdir -p ~/.heal"
-        echo "   cat > ~/.heal/env <<'ENVEOF'"
-        echo "   CLAUDE_CODE_USE_VERTEX=1"
-        echo "   ANTHROPIC_VERTEX_PROJECT_ID=your-project-id"
-        echo "   CLOUD_ML_REGION=global"
-        echo "   VERTEX_LOCATION=global"
-        echo "   GOOGLE_CLOUD_PROJECT=your-project-id"
-        echo "   ENVEOF"
-        echo ""
-        echo "   Then re-run this script."
-        exit 1
-    fi
+    preflight
 
     # Ensure scripts are executable
     chmod +x "${PROJECT_ROOT}/ops/heal-hitch.sh"
@@ -126,7 +175,7 @@ do_install() {
     echo "  systemctl --user status ${SERVICE_NAME}.timer       # timer status"
     echo "  systemctl --user start  ${SERVICE_NAME}.service     # run now"
     echo "  touch ${PROJECT_ROOT}/.heal-trigger                 # trigger run"
-    echo "  journalctl --user -u ${SERVICE_NAME}.service -f     # follow logs"
+    echo "  journalctl _SYSTEMD_USER_UNIT=${SERVICE_NAME}.service -f  # follow logs"
 }
 
 # ---------------------------------------------------------------------------
