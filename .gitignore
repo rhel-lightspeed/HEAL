@@ -60,5 +60,9 @@ config/pattern_fix_config.yaml
 .mypy_cache/
 .ruff_cache/
 
+# Hitch runtime files
+.heal.lock
+.heal-trigger
+
 # Research ideas (private, not ready for publication)
 research/
